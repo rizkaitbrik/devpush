@@ -12,6 +12,7 @@ from redis.asyncio import Redis
 from arq.connections import ArqRedis
 from arq.jobs import Job
 
+from integrations.vcs.models import Commit
 from models import Deployment, Alias, Project, User, Domain, Storage, StorageProject
 from utils.environment import get_environment_for_branch
 from config import Settings, get_settings
@@ -392,7 +393,7 @@ class DeploymentService:
         self,
         project: Project,
         branch: str,
-        commit: dict,
+        commit: Commit,
         db: AsyncSession,
         redis_client: Redis,
         trigger: str = "user",
@@ -427,35 +428,18 @@ class DeploymentService:
         if not runner_image:
             raise ValueError(f"Runner '{runner_slug}' has no image configured.")
 
-        commit_user_author = commit.get("author") or {}
-        commit_user_committer = commit.get("committer") or {}
-        commit_payload = commit.get("commit") or {}
-        commit_payload_author = commit_payload.get("author") or {}
-        commit_payload_committer = commit_payload.get("committer") or {}
-
-        author = (
-            commit_user_author.get("login")
-            or commit_user_committer.get("login")
-            or commit_payload_author.get("name")
-            or commit_payload_committer.get("name")
-            or ""
-        )
-        message = commit_payload.get("message") or ""
-        date_raw = (
-            commit_payload_author.get("date")
-            or commit_payload_committer.get("date")
-            or datetime.now(timezone.utc).isoformat()
-        )
+        author = commit.author.login or commit.author.name
+        date_raw = commit.author.date or datetime.now(timezone.utc).isoformat()
         date = datetime.fromisoformat(date_raw.replace("Z", "+00:00")).isoformat()
 
         deployment = Deployment(
             project=project,
             environment_id=environment.get("id", ""),
             branch=branch,
-            commit_sha=commit["sha"],
+            commit_sha=commit.sha,
             commit_meta={
                 "author": author,
-                "message": message,
+                "message": commit.message,
                 "date": date,
             },
             image=runner_image,

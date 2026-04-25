@@ -5,7 +5,8 @@ import json
 import logging
 from typing import Optional
 
-from services.github import GitHubService
+from integrations.vcs.github import GitHubAdapter
+from integrations.vcs.models import GitTreeType
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +67,7 @@ class PresetDetector:
 
     async def detect(
         self,
-        github_service: GitHubService,
+        github_service: GitHubAdapter,
         user_access_token: str,
         repo_id: int,
         default_branch: str,
@@ -74,7 +75,7 @@ class PresetDetector:
         """Detect preset from repository and return merged config.
 
         Args:
-            github_service: GitHubService instance
+            github_service: GitHubAdapter instance
             user_access_token: User's GitHub OAuth token
             repo_id: Repository ID
             default_branch: Default branch name
@@ -93,7 +94,7 @@ class PresetDetector:
             )
 
             paths = {
-                item["path"] for item in tree.get("tree", []) if item["type"] == "blob"
+                item.path for item in tree.items if item.type == GitTreeType.BLOB
             }
             logger.debug(f"Found {len(paths)} files in repository")
 
@@ -139,7 +140,7 @@ class PresetDetector:
         self,
         paths: set[str],
         pattern: dict,
-        github_service: GitHubService,
+        github_service: GitHubAdapter,
         user_access_token: str,
         repo_id: int,
         default_branch: str,
@@ -202,7 +203,7 @@ class PresetDetector:
 
     async def detect_with_commands(
         self,
-        github_service: GitHubService,
+        github_service: GitHubAdapter,
         user_access_token: str,
         repo_id: int,
         default_branch: str,
