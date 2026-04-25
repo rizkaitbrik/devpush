@@ -1,19 +1,21 @@
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from __future__ import annotations
+
 from datetime import datetime, timezone
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from integrations.vcs.github.adapter import GitHubAdapter
 from models import GithubInstallation
-from services.github import GitHubService
 
 
 class GitHubInstallationService:
-    def __init__(self, github_service: GitHubService):
-        self.github_service = github_service
+    def __init__(self, adapter: GitHubAdapter):
+        self.adapter = adapter
 
     async def get_or_refresh_installation(
         self, installation_id: int, db: AsyncSession
     ) -> GithubInstallation:
-        """Get installation instance, refreshing token if needed."""
         result = await db.execute(
             select(GithubInstallation).where(
                 GithubInstallation.installation_id == installation_id
@@ -24,12 +26,9 @@ class GitHubInstallationService:
         if not installation:
             installation = GithubInstallation(installation_id=installation_id)
 
-        if not installation.token or (
-            installation.token_expires_at
-            and installation.token_expires_at
-            <= datetime.now(timezone.utc).replace(tzinfo=None)
-        ):
-            token_data = await self.github_service.get_installation_access_token(
+        token_expired = installation.token_expires_at and installation.token_expires_at <= datetime.now(timezone.utc).replace(tzinfo=None)
+        if not installation.token or token_expired:
+            token_data = await self.adapter.get_installation_access_token(
                 str(installation_id)
             )
             installation.token = token_data["token"]
