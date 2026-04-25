@@ -17,7 +17,8 @@ from config import get_settings, Settings
 from db import get_db, AsyncSessionLocal
 from dependencies import get_current_user, TemplateResponse
 from models import User, Team, Deployment, Project
-from routers import auth, project, github, google, team, user, event, admin
+from routers import auth, project, google, team, user, event, admin
+from routers.integrations.vcs import github
 from services.loki import LokiService
 
 settings = get_settings()

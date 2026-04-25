@@ -23,7 +23,7 @@ from dependencies import (
 )
 from integrations.vcs.github import GitHubAdapter
 from integrations.vcs.models import Commit, CommitAuthor, EmailType
-from models import User, UserIdentity, GithubInstallation, Project
+from models import User, UserIdentity, VcsInstallation, Project
 from services.deployment import DeploymentService
 from utils.user import get_user_github_token, get_user_by_provider
 from utils.urls import safe_redirect
@@ -290,8 +290,9 @@ async def github_install_callback(
         await github_adapter.get_installation(str(installation_id))
 
         result = await db.execute(
-            select(GithubInstallation).where(
-                GithubInstallation.installation_id == installation_id
+            select(VcsInstallation).where(
+                VcsInstallation.installation_id == installation_id,
+                VcsInstallation.provider == "github",
             )
         )
         existing_installation = result.scalar_one_or_none()
@@ -303,10 +304,13 @@ async def github_install_callback(
                 request, _("GitHub App installation updated successfully!"), "success"
             )
         else:
-            github_installation = GithubInstallation(
-                installation_id=installation_id, status="active"
+            vcs_installation = VcsInstallation(
+                installation_id=installation_id,
+                provider="github",
+                provider_account_id=str(installation_id),
+                status="active",
             )
-            db.add(github_installation)
+            db.add(vcs_installation)
             await db.commit()
             flash(request, _("GitHub App installed successfully!"), "success")
 
@@ -415,10 +419,10 @@ async def github_webhook(
                         "active" if data["action"] == "unsuspended" else data["action"]
                     )
                     await db.execute(
-                        update(GithubInstallation)
+                        update(VcsInstallation)
                         .where(
-                            GithubInstallation.installation_id
-                            == data["installation"]["id"]
+                            VcsInstallation.installation_id == data["installation"]["id"],
+                            VcsInstallation.provider == "github",
                         )
                         .values(status=status)
                     )
@@ -433,8 +437,10 @@ async def github_webhook(
                     token_data = await github_adapter.get_installation_access_token(
                         installation_id
                     )
-                    installation = GithubInstallation(
+                    installation = VcsInstallation(
                         installation_id=installation_id,
+                        provider="github",
+                        provider_account_id=str(installation_id),
                         token=token_data["token"],
                         token_expires_at=datetime.fromisoformat(
                             token_data["expires_at"].replace("Z", "+00:00")
