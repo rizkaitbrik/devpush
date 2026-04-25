@@ -20,13 +20,14 @@ from dependencies import (
     get_current_user,
     RedirectResponseX,
     get_github_oauth_client,
-    get_github_primary_email,
+    get_github_adapter,
     get_google_oauth_client,
     get_google_user_info,
     decode_jwt_claims,
     get_redis_client,
     get_queue,
 )
+from integrations.vcs.models import EmailType
 from db import get_db
 from models import User, UserIdentity, TeamInvite, TeamMember, Team, utc_now
 from forms.auth import EmailLoginForm
@@ -487,10 +488,10 @@ async def auth_github_callback(
         )
 
     token = await oauth_client.github.authorize_access_token(request)
-    response = await oauth_client.github.get("user", token=token)
-    gh_user = response.json()
+    github_adapter = get_github_adapter()
+    gh_user = await github_adapter.get_user_info(token["access_token"])
 
-    user = await get_user_by_provider(db, "github", str(gh_user["id"]))
+    user = await get_user_by_provider(db, "github", gh_user.id)
 
     if user:
         result = await db.execute(
@@ -502,11 +503,13 @@ async def auth_github_callback(
         if github_identity:
             github_identity.access_token = token["access_token"]
             github_identity.provider_metadata = {
-                "login": gh_user["login"],
-                "name": gh_user.get("name"),
+                "login": gh_user.username,
+                "name": gh_user.name,
             }
     else:
-        email = await get_github_primary_email(oauth_client, token)
+        email = next(
+            (e for e, t in gh_user.emails.items() if t == EmailType.PRIMARY), None
+        )
         if email:
             user = await get_user_by_email(db, email)
 
@@ -523,19 +526,19 @@ async def auth_github_callback(
             user = await _create_user_with_team(
                 request,
                 db,
-                email=email or f"{gh_user['login']}@github.local",
-                name=gh_user.get("name"),
-                username=gh_user["login"],
+                email=email or f"{gh_user.username}@github.local",
+                name=gh_user.name,
+                username=gh_user.username,
             )
 
         github_identity = UserIdentity(
             user_id=user.id,
             provider="github",
-            provider_user_id=str(gh_user["id"]),
+            provider_user_id=gh_user.id,
             access_token=token["access_token"],
             provider_metadata={
-                "login": gh_user["login"],
-                "name": gh_user.get("name"),
+                "login": gh_user.username,
+                "name": gh_user.name,
             },
         )
         db.add(github_identity)

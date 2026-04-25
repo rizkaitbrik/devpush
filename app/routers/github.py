@@ -12,7 +12,7 @@ from datetime import datetime
 
 from dependencies import (
     get_current_user,
-    get_github_service,
+    get_github_adapter,
     get_github_oauth_client,
     TemplateResponse,
     flash,
@@ -21,8 +21,9 @@ from dependencies import (
     get_redis_client,
     get_queue,
 )
+from integrations.vcs.github import GitHubAdapter
+from integrations.vcs.models import Commit, CommitAuthor, EmailType
 from models import User, UserIdentity, GithubInstallation, Project
-from services.github import GitHubService
 from services.deployment import DeploymentService
 from utils.user import get_user_github_token, get_user_by_provider
 from utils.urls import safe_redirect
@@ -38,7 +39,7 @@ async def github_repo_select(
     request: Request,
     account: str | None = None,
     current_user: User = Depends(get_current_user),
-    github_service: GitHubService = Depends(get_github_service),
+    github_adapter: GitHubAdapter = Depends(get_github_adapter),
     db: AsyncSession = Depends(get_db),
 ):
     accounts = []
@@ -55,12 +56,8 @@ async def github_repo_select(
             )
         else:
             has_github_oauth_token = True
-            installations = await github_service.get_user_installations(
-                github_oauth_token
-            )
-            accounts = [
-                installation["account"]["login"] for installation in installations
-            ]
+            account_list = await github_adapter.get_accounts(github_oauth_token)
+            accounts = [acc.name for acc in account_list]
             selected_account = account or (accounts[0] if accounts else None)
 
     except Exception as e:
@@ -101,12 +98,12 @@ async def github_repo_select(
 async def github_repo_list(
     request: Request,
     current_user: User = Depends(get_current_user),
-    github: GitHubService = Depends(get_github_service),
+    github_adapter: GitHubAdapter = Depends(get_github_adapter),
     account: str | None = None,
     query: str | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    repos: list[dict] = []
+    repos = []
 
     try:
         github_oauth_token = await get_user_github_token(db, current_user)
@@ -117,53 +114,19 @@ async def github_repo_list(
                 context={"repos": repos},
             )
 
-        installations = await github.get_user_installations(github_oauth_token)
-        installation = next(
-            (inst for inst in installations if inst["account"]["login"] == account),
-            None,
-        )
+        account_list = await github_adapter.get_accounts(github_oauth_token)
+        selected = next((acc for acc in account_list if acc.name == account), None)
 
-        if not installation:
+        if not selected:
             return TemplateResponse(
                 request=request,
                 name="github/partials/_repo-select-list.html",
                 context={"repos": repos},
             )
 
-        selection = installation.get("repository_selection")
-        if selection == "selected":
-            repos = await github.get_installation_repositories_for_user(
-                github_oauth_token, installation["id"]
-            )
-            if query:
-                q_lower = query.lower()
-                repos = [
-                    repo
-                    for repo in repos
-                    if q_lower in repo.get("name", "").lower()
-                    or q_lower in repo.get("full_name", "").lower()
-                ]
-        else:
-            repos = await github.search_user_repositories(
-                github_oauth_token, account, query or ""
-            )
-
-        repos = [
-            repo for repo in repos if repo.get("permissions", {}).get("push", False)
-        ]
-        if selection == "selected" and query:
-            q_lower = query.lower()
-
-            def sort_key(repo: dict):
-                name = (repo.get("name") or "").lower()
-                full_name = (repo.get("full_name") or "").lower()
-                exact = int(name != q_lower and full_name != q_lower)
-                starts = int(
-                    not name.startswith(q_lower) and not full_name.startswith(q_lower)
-                )
-                return (exact, starts, len(name))
-
-            repos = sorted(repos, key=sort_key)
+        repos = await github_adapter.get_repositories(
+            github_oauth_token, selected.id, query or ""
+        )
     except Exception:
         logger.exception("Error fetching repositories from GitHub")
         flash(request, _("Error fetching repositories from GitHub."), "error")
@@ -209,7 +172,7 @@ async def github_authorize_callback(
     request: Request,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-    github_service: GitHubService = Depends(get_github_service),
+    github_adapter: GitHubAdapter = Depends(get_github_adapter),
     oauth_client=Depends(get_github_oauth_client),
 ):
     """Handle GitHub OAuth callback for account linking"""
@@ -226,10 +189,9 @@ async def github_authorize_callback(
 
     try:
         token = await oauth_client.github.authorize_access_token(request)
-        response = await oauth_client.github.get("user", token=token)
-        github_user = response.json()
+        gh_user = await github_adapter.get_user_info(token["access_token"])
 
-        existing_user = await get_user_by_provider(db, "github", str(github_user["id"]))
+        existing_user = await get_user_by_provider(db, "github", gh_user.id)
         if existing_user and existing_user.id != current_user.id:
             flash(
                 request,
@@ -249,18 +211,18 @@ async def github_authorize_callback(
         if github_identity:
             github_identity.access_token = token["access_token"]
             github_identity.provider_metadata = {
-                "login": github_user["login"],
-                "name": github_user.get("name"),
+                "login": gh_user.username,
+                "name": gh_user.name,
             }
         else:
             github_identity = UserIdentity(
                 user_id=current_user.id,
                 provider="github",
-                provider_user_id=str(github_user["id"]),
+                provider_user_id=gh_user.id,
                 access_token=token["access_token"],
                 provider_metadata={
-                    "login": github_user["login"],
-                    "name": github_user.get("name"),
+                    "login": gh_user.username,
+                    "name": gh_user.name,
                 },
             )
             db.add(github_identity)
@@ -310,7 +272,7 @@ async def github_install_callback(
     installation_id: int,
     setup_action: str,
     current_user: User = Depends(get_current_user),
-    github_service: GitHubService = Depends(get_github_service),
+    github_adapter: GitHubAdapter = Depends(get_github_adapter),
     db: AsyncSession = Depends(get_db),
 ):
     """Handle GitHub App installation callback"""
@@ -325,8 +287,7 @@ async def github_install_callback(
         return RedirectResponse(redirect_url, status_code=303)
 
     try:
-        # Make sure installation exists
-        await github_service.get_installation(str(installation_id))
+        await github_adapter.get_installation(str(installation_id))
 
         result = await db.execute(
             select(GithubInstallation).where(
@@ -467,10 +428,9 @@ async def github_webhook(
                     )
 
                 elif data["action"] == "created":
-                    # App installed
                     installation_id = data["installation"]["id"]
-                    github_service = get_github_service()
-                    token_data = await github_service.get_installation_access_token(
+                    github_adapter = get_github_adapter()
+                    token_data = await github_adapter.get_installation_access_token(
                         installation_id
                     )
                     installation = GithubInstallation(
@@ -559,17 +519,16 @@ async def github_webhook(
                     )
                     return Response(status_code=200)
 
-                branch = data["ref"].replace(
-                    "refs/heads/", ""
-                )  # Convert refs/heads/main to main
-                commit_data = {
-                    "sha": data["after"],
-                    "author": {"login": data["pusher"]["name"]},
-                    "commit": {
-                        "message": data["head_commit"]["message"],
-                        "author": {"date": data["head_commit"]["timestamp"]},
-                    },
-                }
+                branch = data["ref"].replace("refs/heads/", "")
+                commit_data = Commit(
+                    sha=data["after"],
+                    message=data["head_commit"]["message"],
+                    author=CommitAuthor(
+                        name=data["pusher"]["name"],
+                        login=data["pusher"]["name"],
+                        date=data["head_commit"]["timestamp"],
+                    ),
+                )
 
                 deployment_service = DeploymentService()
 

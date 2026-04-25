@@ -18,7 +18,7 @@ from dependencies import (
     get_project_by_name,
     get_deployment_by_id,
     get_team_by_slug,
-    get_github_service,
+    get_github_adapter,
     get_redis_client,
     get_queue,
     flash,
@@ -63,8 +63,7 @@ from forms.storage import (
 )
 from config import get_settings, Settings
 from db import get_db
-from services.github import GitHubService
-from services.github_installation import GitHubInstallationService
+from integrations.vcs.github import GitHubAdapter, GitHubInstallationService
 from services.deployment import DeploymentService
 from services.domain import DomainService
 from services.preset_detector import PresetDetector
@@ -201,7 +200,7 @@ async def new_project_details(
     team_and_membership: tuple[Team, TeamMember] = Depends(get_team_by_slug),
     settings: Settings = Depends(get_settings),
     db: AsyncSession = Depends(get_db),
-    github_service: GitHubService = Depends(get_github_service),
+    github_adapter: GitHubAdapter = Depends(get_github_adapter),
     github_installation_service: GitHubInstallationService = Depends(
         get_github_installation_service
     ),
@@ -238,7 +237,7 @@ async def new_project_details(
                     # Run detection with 5 second timeout
                     detection = await asyncio.wait_for(
                         detector.detect_with_commands(
-                            github_service,
+                            github_adapter,
                             github_oauth_token,
                             int(repo_id),
                             repo_default_branch,
@@ -308,7 +307,7 @@ async def new_project_details(
             if not form.repo_id.data:
                 raise ValueError("Repository ID missing.")
 
-            repo = await github_service.get_repository(
+            repo = await github_adapter.get_repository(
                 github_oauth_token, int(form.repo_id.data)
             )
         except Exception:
@@ -318,8 +317,8 @@ async def new_project_details(
             )
 
         try:
-            installation = await github_service.get_repository_installation(
-                repo["full_name"]
+            installation = await github_adapter.get_repository_installation(
+                repo.full_name
             )
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 404:
@@ -327,7 +326,7 @@ async def new_project_details(
                     request,
                     _(
                         "Install the GitHub app on %(repo)s to continue.",
-                        repo=repo["full_name"],
+                        repo=repo.full_name,
                     ),
                     "error",
                 )
@@ -354,7 +353,7 @@ async def new_project_details(
         project = Project(
             name=form.name.data,
             repo_id=form.repo_id.data,
-            repo_full_name=repo["full_name"],
+            repo_full_name=repo.full_name,
             github_installation=github_installation,
             config={
                 "preset": form.preset.data,
@@ -999,7 +998,7 @@ async def project_deploy(
     team_and_membership: tuple[Team, TeamMember] = Depends(get_team_by_slug),
     db: AsyncSession = Depends(get_db),
     settings: Settings = Depends(get_settings),
-    github_service: GitHubService = Depends(get_github_service),
+    github_adapter: GitHubAdapter = Depends(get_github_adapter),
     redis_client: Redis = Depends(get_redis_client),
     queue: ArqRedis = Depends(get_queue),
     github_installation_service: GitHubInstallationService = Depends(
@@ -1022,11 +1021,10 @@ async def project_deploy(
             if not github_installation.token:
                 raise ValueError("GitHub installation token missing.")
 
-            commit = await github_service.get_repository_commit(
-                user_access_token=github_installation.token,
+            commit = await github_adapter.get_repository_commit(
+                access_token=github_installation.token,
                 repo_id=project.repo_id,
-                commit_sha=commit_sha,
-                branch=branch,
+                sha=commit_sha,
             )
 
             deployment = await DeploymentService().create(
@@ -1082,10 +1080,10 @@ async def project_deploy(
         if not github_installation.token:
             raise ValueError("GitHub installation token missing.")
 
-        branches = await github_service.get_repository_branches(
+        branches = await github_adapter.get_repository_branches(
             github_installation.token, project.repo_id
         )
-        branch_names = [branch["name"] for branch in branches]
+        branch_names = [branch.name for branch in branches]
     except Exception as e:
         logger.error(f"Error fetching branches: {str(e)}")
         flash(request, _("Error fetching branches from GitHub."), "error")
@@ -1107,14 +1105,19 @@ async def project_deploy(
                     if not github_installation.token:
                         raise ValueError("GitHub installation token missing.")
 
-                    branch_commits = await github_service.get_repository_commits(
+                    branch_commits = await github_adapter.get_repository_commits(
                         github_installation.token, project.repo_id, branch, per_page=5
                     )
 
-                    # Add branch information to each commit
                     for commit in branch_commits:
-                        commit["branch"] = branch
-                        commits.append(commit)
+                        commits.append({
+                            "branch": branch,
+                            "sha": commit.sha,
+                            "commit": {
+                                "message": commit.message,
+                                "author": {"date": commit.author.date},
+                            },
+                        })
                 except Exception as e:
                     warning_message = _(
                         "Could not fetch commits for branch %(branch)s: %(error)s"
@@ -1151,7 +1154,7 @@ async def project_redeploy(
     team_and_membership: tuple[Team, TeamMember] = Depends(get_team_by_slug),
     deployment: Deployment = Depends(get_deployment_by_id),
     db: AsyncSession = Depends(get_db),
-    github_service: GitHubService = Depends(get_github_service),
+    github_adapter: GitHubAdapter = Depends(get_github_adapter),
     redis_client: Redis = Depends(get_redis_client),
     queue: ArqRedis = Depends(get_queue),
     github_installation_service: GitHubInstallationService = Depends(
@@ -1176,11 +1179,10 @@ async def project_redeploy(
             if not github_installation.token:
                 raise ValueError("GitHub installation token missing.")
 
-            commit = await github_service.get_repository_commit(
-                user_access_token=github_installation.token,
+            commit = await github_adapter.get_repository_commit(
+                access_token=github_installation.token,
                 repo_id=project.repo_id,
-                commit_sha=deployment.commit_sha,
-                branch=deployment.branch,
+                sha=deployment.commit_sha,
             )
 
             new_deployment = await DeploymentService().create(
@@ -1519,9 +1521,8 @@ async def project_settings(
             # Repo
             if general_form.repo_id.data != project.repo_id:
                 try:
-                    github_service = get_github_service()
                     github_oauth_token = await get_user_github_token(db, current_user)
-                    repo = await github_service.get_repository(
+                    repo = await get_github_adapter().get_repository(
                         github_oauth_token or "", general_form.repo_id.data
                     )
                 except Exception:
@@ -1531,7 +1532,7 @@ async def project_settings(
                         "error",
                     )
                 project.repo_id = general_form.repo_id.data
-                project.repo_full_name = repo.get("full_name") or ""
+                project.repo_full_name = repo.full_name if repo else ""
 
             # Avatar upload
             avatar_file = general_form.avatar.data

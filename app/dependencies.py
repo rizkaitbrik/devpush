@@ -20,14 +20,13 @@ from arq.connections import ArqRedis
 from config import get_settings, Settings
 from db import get_db
 from models import User, Project, Deployment, Team, TeamMember, Storage, utc_now
-from services.github import GitHubService
-from services.github_installation import GitHubInstallationService
+from integrations.vcs.github import GitHubAdapter, GitHubInstallationService
 
 
 @lru_cache
-def get_github_service() -> GitHubService:
+def get_github_adapter() -> GitHubAdapter:
     settings = get_settings()
-    return GitHubService(
+    return GitHubAdapter(
         client_id=settings.github_app_client_id,
         client_secret=settings.github_app_client_secret,
         app_id=settings.github_app_id,
@@ -37,7 +36,7 @@ def get_github_service() -> GitHubService:
 
 @lru_cache
 def get_github_installation_service() -> GitHubInstallationService:
-    return GitHubInstallationService(get_github_service())
+    return GitHubInstallationService(get_github_adapter())
 
 
 @lru_cache
@@ -55,22 +54,6 @@ def get_github_oauth_client() -> OAuth:
     )
     return oauth
 
-
-async def get_github_primary_email(oauth_client: OAuth, token: dict) -> str | None:
-    """Get user's primary verified email from GitHub."""
-    try:
-        if not oauth_client.github:
-            return None
-
-        response = await oauth_client.github.get("user/emails", token=token)
-        emails = response.json()
-
-        primary_email = next(
-            (e for e in emails if e.get("primary") and e.get("verified")), None
-        )
-        return primary_email["email"] if primary_email else None
-    except Exception:
-        return None
 
 
 @lru_cache
