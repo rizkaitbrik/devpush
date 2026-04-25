@@ -89,8 +89,8 @@ async def start_deployment(ctx, deployment_id: str):
                     f"echo 'Cloning {deployment.repo_full_name} (Branch: {deployment.branch}, Commit: {deployment.commit_sha[:7]})'"
                 )
                 github_installation = (
-                    await github_installation_service.get_or_refresh_installation(
-                        deployment.project.github_installation_id, db
+                    await github_installation_service.refresh(
+                        deployment.project.vcs_installation_id, db
                     )
                 )
                 env_vars_dict["DEVPUSH_GITHUB_TOKEN"] = github_installation.token

@@ -354,7 +354,7 @@ async def new_project_details(
             name=form.name.data,
             repo_id=form.repo_id.data,
             repo_full_name=repo.full_name,
-            github_installation=github_installation,
+            vcs_installation=github_installation,
             config={
                 "preset": form.preset.data,
                 "runner": form.runner.data,
@@ -1014,8 +1014,8 @@ async def project_deploy(
             branch, commit_sha = form.commit.data.split(":")
 
             github_installation = (
-                await github_installation_service.get_or_refresh_installation(
-                    project.github_installation_id, db
+                await github_installation_service.refresh(
+                    project.vcs_installation_id, db
                 )
             )
             if not github_installation.token:
@@ -1074,7 +1074,7 @@ async def project_deploy(
     try:
         github_installation = (
             await github_installation_service.get_or_refresh_installation(
-                project.github_installation_id, db
+                project.vcs_installation_id, db
             )
         )
         if not github_installation.token:
@@ -1172,8 +1172,8 @@ async def project_redeploy(
     if environment and request.method == "POST" and await form.validate_on_submit():
         try:
             github_installation = (
-                await github_installation_service.get_or_refresh_installation(
-                    project.github_installation_id, db
+                await github_installation_service.refresh(
+                    project.vcs_installation_id, db
                 )
             )
             if not github_installation.token:

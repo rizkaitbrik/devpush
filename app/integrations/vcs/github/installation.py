@@ -6,7 +6,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from integrations.vcs.github.adapter import GitHubAdapter
-from models import GithubInstallation
+from db.models import VcsInstallation
+
+
+def _is_token_expired(installation: VcsInstallation) -> bool:
+    return bool(
+        installation.token_expires_at
+        and installation.token_expires_at
+        <= datetime.now(timezone.utc).replace(tzinfo=None)
+    )
 
 
 class GitHubInstallationService:
@@ -14,22 +22,27 @@ class GitHubInstallationService:
         self.adapter = adapter
 
     async def get_or_refresh_installation(
-        self, installation_id: int, db: AsyncSession
-    ) -> GithubInstallation:
+        self, github_installation_id: int, db: AsyncSession
+    ) -> VcsInstallation:
+        """Find or create a VcsInstallation by GitHub App installation ID and refresh its token."""
         result = await db.execute(
-            select(GithubInstallation).where(
-                GithubInstallation.installation_id == installation_id
+            select(VcsInstallation).where(
+                VcsInstallation.installation_id == github_installation_id,
+                VcsInstallation.provider == "github",
             )
         )
         installation = result.scalar_one_or_none()
 
         if not installation:
-            installation = GithubInstallation(installation_id=installation_id)
+            installation = VcsInstallation(
+                installation_id=github_installation_id,
+                provider="github",
+                provider_account_id=str(github_installation_id),
+            )
 
-        token_expired = installation.token_expires_at and installation.token_expires_at <= datetime.now(timezone.utc).replace(tzinfo=None)
-        if not installation.token or token_expired:
+        if not installation.token or _is_token_expired(installation):
             token_data = await self.adapter.get_installation_access_token(
-                str(installation_id)
+                str(github_installation_id)
             )
             installation.token = token_data["token"]
             installation.token_expires_at = datetime.fromisoformat(
@@ -38,4 +51,25 @@ class GitHubInstallationService:
 
         installation = await db.merge(installation)
         await db.commit()
+        return installation
+
+    async def refresh(self, vcs_installation_id: str, db: AsyncSession) -> VcsInstallation:
+        """Load a VcsInstallation by its PK and refresh its token if expired."""
+        result = await db.execute(
+            select(VcsInstallation).where(VcsInstallation.id == vcs_installation_id)
+        )
+        installation = result.scalar_one_or_none()
+        if not installation:
+            raise ValueError(f"VcsInstallation {vcs_installation_id!r} not found")
+
+        if not installation.token or _is_token_expired(installation):
+            token_data = await self.adapter.get_installation_access_token(
+                str(installation.installation_id)
+            )
+            installation.token = token_data["token"]
+            installation.token_expires_at = datetime.fromisoformat(
+                token_data["expires_at"].replace("Z", "+00:00")
+            ).replace(tzinfo=None)
+            await db.commit()
+
         return installation
