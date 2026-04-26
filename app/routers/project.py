@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, Request, Query, HTTPException
 import httpx
 from fastapi.responses import Response, RedirectResponse
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from datetime import datetime, timedelta, timezone
@@ -33,6 +33,7 @@ from models import (
     Project,
     Deployment,
     Domain,
+    EnvVar,
     User,
     Team,
     TeamMember,
@@ -341,15 +342,6 @@ async def new_project_details(
             )
         )
 
-        env_vars = [
-            {
-                "key": entry.key.data,
-                "value": entry.value.data,
-                "environment": entry.environment.data,
-            }
-            for entry in form.env_vars
-        ]
-
         project = Project(
             name=form.name.data,
             repo_id=form.repo_id.data,
@@ -363,7 +355,6 @@ async def new_project_details(
                 "pre_deploy_command": form.pre_deploy_command.data,
                 "start_command": form.start_command.data,
             },
-            env_vars=env_vars,
             environments=[
                 {
                     "id": "prod",
@@ -379,6 +370,15 @@ async def new_project_details(
         )
 
         db.add(project)
+        await db.flush()
+
+        for entry in form.env_vars:
+            if entry.key.data:
+                env_var = EnvVar(project_id=project.id, key=entry.key.data)
+                env_var.value = entry.value.data or ""
+                env_var.environment = entry.environment.data or None
+                db.add(env_var)
+
         await db.commit()
         flash(request, _("Project added."), "success")
 
@@ -1624,6 +1624,8 @@ async def project_settings(
     )
     project_storages = storages_result.scalars().all()
 
+    existing_env_vars = await project.get_env_vars(db)
+
     env_vars_form: Any = await ProjectEnvVarsForm.from_formdata(
         request,
         data={
@@ -1633,7 +1635,7 @@ async def project_settings(
                     "value": env.get("value", ""),
                     "environment": env.get("environment", ""),
                 }
-                for env in project.env_vars
+                for env in existing_env_vars
             ]
         },
     )
@@ -1647,14 +1649,15 @@ async def project_settings(
 
     if fragment == "env_vars":
         if await env_vars_form.validate_on_submit():
-            project.env_vars = [
-                {
-                    "key": entry.key.data,
-                    "value": entry.value.data,
-                    "environment": entry.environment.data,
-                }
-                for entry in env_vars_form.env_vars
-            ]
+            await db.execute(
+                delete(EnvVar).where(EnvVar.project_id == project.id)
+            )
+            for entry in env_vars_form.env_vars:
+                if entry.key.data:
+                    env_var = EnvVar(project_id=project.id, key=entry.key.data)
+                    env_var.value = entry.value.data or ""
+                    env_var.environment = entry.environment.data or None
+                    db.add(env_var)
             await db.commit()
             flash(request, _("Environment variables updated."), "success")
 
@@ -1697,6 +1700,15 @@ async def project_settings(
                     }
 
                     project.update_environment(environment_id, values)
+                    rename = getattr(project, "_rename_env_slug", None)
+                    if rename:
+                        old_slug, new_slug = rename
+                        await db.execute(
+                            update(EnvVar)
+                            .where(EnvVar.project_id == project.id, EnvVar.environment == old_slug)
+                            .values(environment=new_slug)
+                        )
+                        del project._rename_env_slug
                     await db.commit()
                     flash(request, _("Environment updated."), "success")
                     environments_updated = True
@@ -1723,6 +1735,15 @@ async def project_settings(
             try:
                 environment_id = remove_environment_form.environment_id.data
                 if project.delete_environment(environment_id):
+                    slug_to_delete = getattr(project, "_delete_env_slug", None)
+                    if slug_to_delete:
+                        await db.execute(
+                            delete(EnvVar).where(
+                                EnvVar.project_id == project.id,
+                                EnvVar.environment == slug_to_delete,
+                            )
+                        )
+                        del project._delete_env_slug
                     domains_result = await db.execute(
                         select(Domain).where(
                             Domain.project_id == project.id,

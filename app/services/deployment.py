@@ -432,6 +432,8 @@ class DeploymentService:
         date_raw = commit.author.date or datetime.now(timezone.utc).isoformat()
         date = datetime.fromisoformat(date_raw.replace("Z", "+00:00")).isoformat()
 
+        env_vars_snapshot = await project.get_env_vars(db, environment.get("slug"))
+
         deployment = Deployment(
             project=project,
             environment_id=environment.get("id", ""),
@@ -447,6 +449,7 @@ class DeploymentService:
             created_by_user_id=current_user.id
             if trigger == "user" and current_user
             else None,
+            env_vars=env_vars_snapshot,
         )
         db.add(deployment)
         await db.commit()
