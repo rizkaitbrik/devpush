@@ -94,13 +94,12 @@ class Deployment(Base):
         foreign_keys=[created_by_user_id]
     )
 
-    def __init__(self, *args, project: "Project", environment_id: str, **kwargs):
+    def __init__(self, *args, project: "Project", environment_id: str, env_vars: list | None = None, **kwargs):
         super().__init__(project=project, environment_id=environment_id, **kwargs)
         self.repo_id = project.repo_id
         self.repo_full_name = project.repo_full_name
         self.config = project.config
-        environment = project.get_environment_by_id(environment_id)
-        self.env_vars = project.get_env_vars(environment["slug"]) if environment else []
+        self.env_vars = env_vars or []
 
     @property
     def environment(self) -> dict | None:

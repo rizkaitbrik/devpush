@@ -10,6 +10,7 @@ from db.models import (
     TeamInvite,
     VcsInstallation,
     Project,
+    EnvVar,
     Storage,
     StorageProject,
     Deployment,

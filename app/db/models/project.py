@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 from datetime import datetime
 from secrets import token_hex
@@ -14,8 +13,8 @@ from sqlalchemy import (
     Index,
     JSON,
     String,
-    Text,
     UniqueConstraint,
+    delete,
     event,
     func,
     select,
@@ -26,7 +25,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from config import get_settings
 from db import Base
-from db.models._utils import get_fernet, utc_now
+from db.models._utils import utc_now
 from db.models.team import Team
 from db.models.user import User
 from db.models.vcs_installation import VcsInstallation
@@ -35,6 +34,7 @@ from utils.color import get_color
 if TYPE_CHECKING:
     from db.models.deployment import Alias, Deployment
     from db.models.domain import Domain
+    from db.models.env_var import EnvVar
     from db.models.storage import Storage, StorageProject
 
 
@@ -61,7 +61,6 @@ class Project(Base):
     environments: Mapped[list[dict[str, str]]] = mapped_column(
         JSON, nullable=False, default=list
     )
-    _env_vars: Mapped[str] = mapped_column("env_vars", Text, nullable=False, default="")
     slug: Mapped[str] = mapped_column(String(40), nullable=True, unique=True)
     config: Mapped[dict[str, object]] = mapped_column(
         JSON, nullable=False, default=dict
@@ -83,6 +82,9 @@ class Project(Base):
     team_id: Mapped[str] = mapped_column(ForeignKey("team.id"), index=True)
 
     vcs_installation: Mapped[VcsInstallation] = relationship(back_populates="projects")
+    env_var_rows: Mapped[list["EnvVar"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
     deployments: Mapped[list["Deployment"]] = relationship(back_populates="project")
     team: Mapped[Team] = relationship(back_populates="projects")
     created_by_user: Mapped[User | None] = relationship(
@@ -104,20 +106,6 @@ class Project(Base):
     )
 
     @property
-    def env_vars(self) -> list[dict[str, str]]:
-        if self._env_vars:
-            fernet = get_fernet()
-            decrypted = fernet.decrypt(self._env_vars.encode()).decode()
-            return json.loads(decrypted)
-        return []
-
-    @env_vars.setter
-    def env_vars(self, value: list[dict[str, str]]):
-        json_str = json.dumps(value or [])
-        fernet = get_fernet()
-        self._env_vars = fernet.encrypt(json_str.encode()).decode()
-
-    @property
     def hostname(self) -> str:
         settings = get_settings()
         return f"{self.slug}.{settings.deploy_domain}"
@@ -135,14 +123,32 @@ class Project(Base):
     def __repr__(self):
         return f"<Project {self.name}>"
 
-    def get_env_vars(self, environment: str) -> list[dict[str, str]]:
-        """Flattened env vars for a specific environment."""
-        env_vars = [var for var in self.env_vars if not var.get("environment")]
-        for var in self.env_vars:
-            if var.get("environment") == environment:
-                env_vars = [v for v in env_vars if v["key"] != var["key"]]
-                env_vars.append(var)
-        return env_vars
+    async def get_env_vars(
+        self, db: AsyncSession, environment: str | None = None
+    ) -> list[dict[str, str]]:
+        """Flattened env vars for a specific environment.
+
+        Returns global vars overridden by environment-specific vars.
+        """
+        from db.models.env_var import EnvVar
+
+        result = await db.execute(
+            select(EnvVar)
+            .where(EnvVar.project_id == self.id)
+            .order_by(EnvVar.created_at)
+        )
+        rows = result.scalars().all()
+
+        merged: dict[str, dict] = {}
+        for row in rows:
+            if row.environment is None:
+                merged[row.key] = {"key": row.key, "value": row.value, "environment": None}
+        if environment:
+            for row in rows:
+                if row.environment == environment:
+                    merged[row.key] = {"key": row.key, "value": row.value, "environment": environment}
+
+        return list(merged.values())
 
     def has_active_environment_with_slug(
         self, slug: str, exclude_id: str | None = None
@@ -206,11 +212,7 @@ class Project(Base):
         self.environments = environments
 
         if new_slug and new_slug != old_slug:
-            env_vars = self.env_vars.copy()
-            for var in env_vars:
-                if var.get("environment") == old_slug:
-                    var["environment"] = new_slug
-            self.env_vars = env_vars
+            self._rename_env_slug = (old_slug, new_slug)
 
         return environments[env_index]
 
@@ -226,9 +228,7 @@ class Project(Base):
         if not env:
             return False
 
-        env_vars = self.env_vars.copy()
-        env_vars = [var for var in env_vars if var.get("environment") != env["slug"]]
-        self.env_vars = env_vars
+        self._delete_env_slug = env["slug"]
 
         env_index = next(
             i for i, e in enumerate(self.environments) if e["id"] == environment_id
