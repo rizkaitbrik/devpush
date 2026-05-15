@@ -1,10 +1,225 @@
 import asyncio
 import aiodocker
+import base64
 import logging
 from sqlalchemy import select, true
 from sqlalchemy.orm import joinedload
 from pathlib import Path
 import shlex
+
+# Detection script that runs inside the buildpack container to find the web
+# entry point when no Procfile exists. Embedded via base64 to avoid shell
+# escaping issues. Covers all major Heroku buildpack runtimes and handles
+# nested project structures (src/ layout, packages, etc.).
+_DETECT_ENTRYPOINT_SCRIPT = (
+    "import glob, json, os, re, sys\n"
+    "\n"
+    "APP = '/app'\n"
+    "PORT = os.environ.get('PORT', '8000')\n"
+    "\n"
+    "SKIP = {\n"
+    "    'venv', '.venv', '__pycache__', 'node_modules', '.git',\n"
+    "    'tests', 'test', 'migrations', '.pytest_cache', 'dist', 'build',\n"
+    "    '.mypy_cache', 'htmlcov', 'static', 'public', 'media',\n"
+    "}\n"
+    "\n"
+    # Priority by filename convention — agnostic of which framework is used.
+    # asgi.py / wsgi.py are universal conventions; then common entry point names.
+    "PRIORITY = ['asgi.py', 'wsgi.py', 'main.py', 'app.py', 'server.py',\n"
+    "            'application.py', 'run.py', 'api.py']\n"
+    "\n"
+    # Derive the import root by walking up the __init__.py chain.
+    # Works for any layout: flat, src/, nested packages, etc.
+    "def import_root(fpath):\n"
+    "    d = os.path.dirname(fpath)\n"
+    "    while d not in (APP, '/'):\n"
+    "        if not os.path.exists(os.path.join(d, '__init__.py')):\n"
+    "            return d\n"
+    "        d = os.path.dirname(d)\n"
+    "    return APP\n"
+    "\n"
+    "def to_module(fpath):\n"
+    "    root = import_root(fpath)\n"
+    "    rel = os.path.relpath(fpath, root).replace('\\\\', '/')\n"
+    "    parts = rel.replace('.py', '').split('/')\n"
+    "    if parts[-1] == '__init__':\n"
+    "        parts = parts[:-1]\n"
+    "    return '.'.join(parts), root\n"
+    "\n"
+    "def file_priority(fname):\n"
+    "    try:\n"
+    "        return len(PRIORITY) - PRIORITY.index(fname)\n"
+    "    except ValueError:\n"
+    "        return 0\n"
+    "\n"
+    "def walk_py():\n"
+    "    for root, dirs, files in os.walk(APP):\n"
+    "        dirs[:] = sorted(d for d in dirs if d not in SKIP and not d.startswith('.'))\n"
+    "        for f in files:\n"
+    "            if f.endswith('.py'):\n"
+    "                yield file_priority(f), os.path.join(root, f)\n"
+    "\n"
+    # Find the app variable name without knowing the framework.
+    # Looks for common variable names first, then any top-level callable result.
+    "def app_var(content):\n"
+    "    for name in ('app', 'application', 'server', 'api', 'create_app'):\n"
+    "        if re.search(rf'^\\s*{name}\\s*=', content, re.M):\n"
+    "            return name\n"
+    "    m = re.search(r'^\\s*([a-zA-Z_]\\w*)\\s*=\\s*\\w+\\s*\\(', content, re.M)\n"
+    "    return m.group(1) if m else 'app'\n"
+    "\n"
+    "def find_python():\n"
+    # Detect what servers the buildpack actually installed — not which framework.
+    "    bin_dir = '/app/.heroku/python/bin'\n"
+    "    has_uvicorn = os.path.exists(os.path.join(bin_dir, 'uvicorn'))\n"
+    "    has_gunicorn = os.path.exists(os.path.join(bin_dir, 'gunicorn'))\n"
+    "    if not has_uvicorn and not has_gunicorn:\n"
+    # Fall back to system PATH
+    "        import shutil\n"
+    "        has_uvicorn = bool(shutil.which('uvicorn'))\n"
+    "        has_gunicorn = bool(shutil.which('gunicorn'))\n"
+    "    candidates = []\n"
+    "    for score, fpath in sorted(walk_py(), reverse=True):\n"
+    "        fname = os.path.basename(fpath)\n"
+    "        try:\n"
+    "            content = open(fpath, errors='ignore').read()\n"
+    "        except OSError:\n"
+    "            continue\n"
+    "        mod, app_dir = to_module(fpath)\n"
+    "        var = app_var(content)\n"
+    # asgi.py → always ASGI regardless of framework
+    "        if fname == 'asgi.py':\n"
+    "            candidates.append((score + 20, mod, var, 'uvicorn', app_dir))\n"
+    # wsgi.py → always WSGI regardless of framework
+    "        elif fname == 'wsgi.py':\n"
+    "            candidates.append((score + 15, mod, var, 'gunicorn', app_dir))\n"
+    # Other named entry points: use whichever server is installed
+    "        elif fname in PRIORITY and (has_uvicorn or has_gunicorn):\n"
+    "            srv = 'uvicorn' if has_uvicorn else 'gunicorn'\n"
+    "            candidates.append((score, mod, var, srv, app_dir))\n"
+    "    if not candidates:\n"
+    "        return None\n"
+    "    candidates.sort(reverse=True)\n"
+    "    _, mod, var, srv, app_dir = candidates[0]\n"
+    "    if srv == 'uvicorn':\n"
+    "        return f'web: uvicorn {mod}:{var} --app-dir {app_dir} --host 0.0.0.0 --port {PORT}', f'Python (uvicorn)'\n"
+    "    return f'web: gunicorn {mod}:{var} --chdir {app_dir} --bind 0.0.0.0:{PORT}', f'Python (gunicorn)'\n"
+    "\n"
+    "def find_django():\n"
+    "    for _, fpath in walk_py():\n"
+    "        if os.path.basename(fpath) == 'wsgi.py':\n"
+    "            mod, app_dir = to_module(fpath)\n"
+    "            return f'web: gunicorn {mod} --chdir {app_dir} --bind 0.0.0.0:{PORT}', 'Django'\n"
+    "    for root, dirs, files in os.walk(APP):\n"
+    "        dirs[:] = [d for d in dirs if d not in SKIP and not d.startswith('.')]\n"
+    "        if 'settings.py' in files:\n"
+    "            _, app_dir = to_module(os.path.join(root, 'settings.py'))\n"
+    "            pkg = os.path.basename(root)\n"
+    "            return f'web: gunicorn {pkg}.wsgi --chdir {app_dir} --bind 0.0.0.0:{PORT}', 'Django (settings)'\n"
+    "    return None\n"
+    "\n"
+    "def find_node():\n"
+    "    pkg = os.path.join(APP, 'package.json')\n"
+    "    try:\n"
+    "        data = json.load(open(pkg))\n"
+    "        if data.get('scripts', {}).get('start'):\n"
+    "            return 'web: npm start', 'Node.js (npm start)'\n"
+    "        main = data.get('main')\n"
+    "        if main and os.path.exists(os.path.join(APP, main)):\n"
+    "            return f'web: node {main}', 'Node.js (main)'\n"
+    "    except (OSError, json.JSONDecodeError):\n"
+    "        pass\n"
+    "    for entry in ['index.js', 'server.js', 'app.js', 'src/index.js']:\n"
+    "        if os.path.exists(os.path.join(APP, entry)):\n"
+    "            return f'web: node {entry}', f'Node.js ({entry})'\n"
+    "    return 'web: npm start', 'Node.js (fallback)'\n"
+    "\n"
+    "def find_go():\n"
+    "    for search_dir in [os.path.join(APP, 'bin'), APP]:\n"
+    "        try:\n"
+    "            for name in os.listdir(search_dir):\n"
+    "                fp = os.path.join(search_dir, name)\n"
+    "                if os.path.isfile(fp) and os.access(fp, os.X_OK) and '.' not in name:\n"
+    "                    return f'web: {fp}', f'Go (binary: {name})'\n"
+    "        except OSError:\n"
+    "            pass\n"
+    "    return 'web: go run .', 'Go (source)'\n"
+    "\n"
+    "def find_rust():\n"
+    "    try:\n"
+    "        content = open(os.path.join(APP, 'Cargo.toml'), errors='ignore').read()\n"
+    "        m = re.search(r'^name\\s*=\\s*[\"\\']([^\"\\']+)[\"\\']', content, re.M)\n"
+    "        name = m.group(1) if m else 'app'\n"
+    "    except OSError:\n"
+    "        name = 'app'\n"
+    "    return f'web: ./target/release/{name}', f'Rust ({name})'\n"
+    "\n"
+    "def find_java():\n"
+    "    jars = glob.glob(os.path.join(APP, 'target', '*.jar'))\n"
+    "    jars += glob.glob(os.path.join(APP, 'build', 'libs', '*.jar'))\n"
+    "    jars = [j for j in jars if not j.endswith('-sources.jar')]\n"
+    "    if jars:\n"
+    "        return f'web: java -jar {jars[0]} --server.port={PORT}', 'Java (jar)'\n"
+    "    return f'web: java -jar target/*.jar --server.port={PORT}', 'Java (no jar found)'\n"
+    "\n"
+    "result = label = None\n"
+    "\n"
+    "if os.path.exists(os.path.join(APP, 'manage.py')):\n"
+    "    out = find_django()\n"
+    "    if out: result, label = out\n"
+    "\n"
+    "if not result:\n"
+    "    has_py = any(True for _ in zip(walk_py(), range(1)))\n"
+    "    if has_py:\n"
+    "        out = find_python()\n"
+    "        if out: result, label = out\n"
+    "\n"
+    "if not result and os.path.exists(os.path.join(APP, 'package.json')):\n"
+    "    result, label = find_node()\n"
+    "\n"
+    "if not result and os.path.exists(os.path.join(APP, 'config.ru')):\n"
+    "    result = f'web: bundle exec rackup config.ru -p {PORT} --host 0.0.0.0'\n"
+    "    label = 'Ruby/Rack'\n"
+    "\n"
+    "if not result and os.path.exists(os.path.join(APP, 'Gemfile')):\n"
+    "    try:\n"
+    "        gem = open(os.path.join(APP, 'Gemfile'), errors='ignore').read().lower()\n"
+    "        if 'rails' in gem:\n"
+    "            result = f'web: bundle exec rails server -p {PORT} -b 0.0.0.0'\n"
+    "            label = 'Ruby/Rails'\n"
+    "    except OSError:\n"
+    "        pass\n"
+    "\n"
+    "if not result and os.path.exists(os.path.join(APP, 'go.mod')):\n"
+    "    result, label = find_go()\n"
+    "\n"
+    "if not result and os.path.exists(os.path.join(APP, 'Cargo.toml')):\n"
+    "    result, label = find_rust()\n"
+    "\n"
+    "if not result and (\n"
+    "    os.path.exists(os.path.join(APP, 'pom.xml')) or\n"
+    "    os.path.exists(os.path.join(APP, 'build.gradle'))\n"
+    "):\n"
+    "    result, label = find_java()\n"
+    "\n"
+    "if not result and (\n"
+    "    os.path.exists(os.path.join(APP, 'composer.json')) or\n"
+    "    any(f.endswith('.php') for f in os.listdir(APP) if os.path.isfile(os.path.join(APP, f)))\n"
+    "):\n"
+    "    result = 'web: vendor/bin/heroku-php-apache2'\n"
+    "    label = 'PHP'\n"
+    "\n"
+    "if not result and os.path.exists(os.path.join(APP, 'build.sbt')):\n"
+    "    result = 'web: target/start'\n"
+    "    label = 'Scala'\n"
+    "\n"
+    "if result:\n"
+    "    print(f'[detect] {label}: {result}', file=sys.stderr)\n"
+    "    print(result)\n"
+    "else:\n"
+    "    print('[detect] WARNING: could not detect runtime', file=sys.stderr)\n"
+    "    sys.exit(1)\n"
+)
 
 from models import Alias, Deployment, Project
 from db import AsyncSessionLocal
@@ -81,8 +296,14 @@ async def start_deployment(ctx, deployment_id: str):
                     deployment, db, settings
                 )
 
+                config = deployment.config or {}
+
                 # Prepare commands
                 commands = []
+
+                is_buildpack = config.get("runner") == "buildpack"
+                if is_buildpack:
+                    env_vars_dict["PORT"] = "8000"
 
                 # Step 1: Clone the repository
                 commands.append(
@@ -94,28 +315,46 @@ async def start_deployment(ctx, deployment_id: str):
                     )
                 )
                 env_vars_dict["DEVPUSH_GITHUB_TOKEN"] = github_installation.token
-                commands.append(
-                    "git init -q && "
-                    "printf '%s\n' "
-                    "'#!/bin/sh' "
-                    '\'case "$1" in *Username*) echo "x-access-token";; *) echo "$DEVPUSH_GITHUB_TOKEN";; esac\' '
-                    "> /tmp/devpush-git-askpass && "
-                    "chmod 700 /tmp/devpush-git-askpass && "
-                    "export GIT_ASKPASS=/tmp/devpush-git-askpass GIT_TERMINAL_PROMPT=0 && "
-                    f"git fetch -q --depth 1 https://github.com/{deployment.repo_full_name}.git {deployment.commit_sha} && "
-                    "git checkout -q FETCH_HEAD && "
-                    "unset GIT_ASKPASS GIT_TERMINAL_PROMPT DEVPUSH_GITHUB_TOKEN && "
-                    "rm -f /tmp/devpush-git-askpass"
-                )
 
-                # Step 2: Change root directory
+                if is_buildpack:
+                    clone_cmd = (
+                        "mkdir -p /tmp/app && "
+                        "printf '%s\n' "
+                        "'#!/bin/sh' "
+                        '\'case "$1" in *Username*) echo "x-access-token";; *) echo "$DEVPUSH_GITHUB_TOKEN";; esac\' '
+                        "> /tmp/devpush-git-askpass && "
+                        "chmod 700 /tmp/devpush-git-askpass && "
+                        "export GIT_ASKPASS=/tmp/devpush-git-askpass GIT_TERMINAL_PROMPT=0 && "
+                        f"git -C /tmp/app init -q && "
+                        f"git -C /tmp/app fetch -q --depth 1 https://github.com/{deployment.repo_full_name}.git {deployment.commit_sha} && "
+                        "git -C /tmp/app checkout -q FETCH_HEAD && "
+                        "unset GIT_ASKPASS GIT_TERMINAL_PROMPT DEVPUSH_GITHUB_TOKEN && "
+                        "rm -f /tmp/devpush-git-askpass"
+                    )
+                else:
+                    clone_cmd = (
+                        "git init -q && "
+                        "printf '%s\n' "
+                        "'#!/bin/sh' "
+                        '\'case "$1" in *Username*) echo "x-access-token";; *) echo "$DEVPUSH_GITHUB_TOKEN";; esac\' '
+                        "> /tmp/devpush-git-askpass && "
+                        "chmod 700 /tmp/devpush-git-askpass && "
+                        "export GIT_ASKPASS=/tmp/devpush-git-askpass GIT_TERMINAL_PROMPT=0 && "
+                        f"git fetch -q --depth 1 https://github.com/{deployment.repo_full_name}.git {deployment.commit_sha} && "
+                        "git checkout -q FETCH_HEAD && "
+                        "unset GIT_ASKPASS GIT_TERMINAL_PROMPT DEVPUSH_GITHUB_TOKEN && "
+                        "rm -f /tmp/devpush-git-askpass"
+                    )
+                commands.append(clone_cmd)
+
+                # Step 2: Change root directory (non-buildpack only)
                 normalized_root_directory = (
                     deployment.config.get("root_directory", "")
                     .strip()
                     .lstrip("./")
                     .strip("/")
                 )
-                if normalized_root_directory not in ("", ".", "./"):
+                if not is_buildpack and normalized_root_directory not in ("", ".", "./"):
                     quoted_root_directory = shlex.quote(normalized_root_directory)
                     commands.append(
                         f"echo 'Changing root directory to {normalized_root_directory}'"
@@ -125,12 +364,34 @@ async def start_deployment(ctx, deployment_id: str):
                     )
                     commands.append(f"cd {quoted_root_directory}")
 
-                # Step 3: Install dependencies
-                if deployment.config.get("build_command"):
+                # Step 3: Install dependencies / build
+                if is_buildpack:
+                    commands.append("echo 'Running buildpack detection and build...'")
+                    # herokuish exits non-zero when no Procfile/process types are
+                    # found — that's expected here, so we must not let it abort
+                    # the rest of the chain.
+                    commands.append("herokuish buildpack build || true")
+                    # If herokuish didn't produce a Procfile, run the detection
+                    # script to find the web entry point. The script is base64-
+                    # encoded to avoid shell-quoting issues and injected at
+                    # runtime rather than baked into the image.
+                    _script_b64 = base64.b64encode(
+                        _DETECT_ENTRYPOINT_SCRIPT.encode()
+                    ).decode()
+                    commands.append(
+                        f"if [ ! -f /app/Procfile ]; then "
+                        f"echo 'No Procfile found, running entry-point detection...' && "
+                        f"echo '{_script_b64}' | base64 -d > /tmp/_detect_entrypoint.py && "
+                        f"PROCFILE_LINE=$(python3 /tmp/_detect_entrypoint.py) && "
+                        f"echo \"$PROCFILE_LINE\" > /app/Procfile && "
+                        f"echo \"Generated Procfile: $(cat /app/Procfile)\"; "
+                        f"fi"
+                    )
+                elif deployment.config.get("build_command"):
                     commands.append("echo 'Installing dependencies...'")
                     commands.append(f"( {deployment.config.get('build_command')} )")
 
-                # Step 4: Run pre-deploy command
+                # Step 4: Pre-deploy command
                 if deployment.config.get("pre_deploy_command"):
                     commands.append("echo 'Running pre-deploy command...'")
                     commands.append(
@@ -139,7 +400,10 @@ async def start_deployment(ctx, deployment_id: str):
 
                 # Step 5: Start the application
                 commands.append("echo 'Starting application...'")
-                commands.append(f"( {deployment.config.get('start_command')} )")
+                if is_buildpack:
+                    commands.append("herokuish procfile start web")
+                else:
+                    commands.append(f"( {deployment.config.get('start_command')} )")
 
                 # Setup container configuration
                 container_name = f"runner-{deployment.id[:7]}"
@@ -168,8 +432,6 @@ async def start_deployment(ctx, deployment_id: str):
                     )
                 else:
                     labels[f"traefik.http.routers.{router}.entrypoints"] = "web"
-
-                config = deployment.config or {}
 
                 cpus: float | None = settings.default_cpus
                 memory_mb: int | None = settings.default_memory_mb
