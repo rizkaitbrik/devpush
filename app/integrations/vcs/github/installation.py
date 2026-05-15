@@ -10,11 +10,10 @@ from db.models import VcsInstallation
 
 
 def _is_token_expired(installation: VcsInstallation) -> bool:
-    return bool(
-        installation.token_expires_at
-        and installation.token_expires_at
-        <= datetime.now(timezone.utc).replace(tzinfo=None)
-    )
+    if not installation.token_expires_at:
+        return False
+    expires = installation.token_expires_at.replace(tzinfo=None)
+    return expires <= datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 class GitHubInstallationService:

@@ -133,7 +133,11 @@ class PresetDetector:
             return {"preset": preset_slug, "config": merged_config}
 
         except Exception as e:
-            logger.exception(f"Preset detection failed: {e}")
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status in (403, 404):
+                logger.warning(f"Preset detection skipped (HTTP {status}): {e}")
+            else:
+                logger.exception(f"Preset detection failed: {e}")
             return None
 
     async def _matches_pattern(

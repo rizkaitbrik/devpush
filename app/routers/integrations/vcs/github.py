@@ -9,6 +9,7 @@ from redis.asyncio import Redis
 from arq.connections import ArqRedis
 import httpx
 from datetime import datetime
+from authlib.integrations.base_client.errors import MismatchingStateError
 
 from dependencies import (
     get_current_user,
@@ -230,6 +231,9 @@ async def github_authorize_callback(
         await db.commit()
         flash(request, _("GitHub account connected successfully!"), "success")
 
+    except MismatchingStateError:
+        logger.warning("GitHub OAuth state mismatch (stale session or back button)")
+        flash(request, _("Authorization expired. Please try again."), "error")
     except Exception:
         logger.exception("Error connecting GitHub account")
         flash(request, _("Error connecting GitHub account."), "error")
@@ -445,7 +449,7 @@ async def github_webhook(
                         token=token_data["token"],
                         token_expires_at=datetime.fromisoformat(
                             token_data["expires_at"].replace("Z", "+00:00")
-                        ),
+                        ).replace(tzinfo=None),
                     )
                     await db.merge(installation)
                     await db.commit()
