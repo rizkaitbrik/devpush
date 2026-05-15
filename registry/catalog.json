@@ -1,6 +1,6 @@
 {
   "meta": {
-    "version": "1.0.5",
+    "version": "1.0.6",
     "source": "bundled"
   },
   "runners": [
@@ -63,6 +63,14 @@
       "name": "FrankenPHP (PHP 8.3, Worker Mode) + Node 22",
       "category": "PHP",
       "image": "ghcr.io/devpushhq/runner-frankenphp-node-worker-8.3:1.0.2"
+    },
+    {
+      "slug": "buildpack",
+      "name": "Buildpack (Auto)",
+      "category": "Buildpack",
+      "image": "gliderlabs/herokuish:latest",
+      "buildpack": true,
+      "enabled": true
     }
   ],
   "presets": [
