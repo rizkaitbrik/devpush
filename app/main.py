@@ -18,7 +18,7 @@ from db import get_db, AsyncSessionLocal
 from dependencies import get_current_user, TemplateResponse
 from models import User, Team, Deployment, Project
 from routers import auth, project, google, team, user, event, admin
-from routers.integrations.vcs import github
+from routers.integrations.vcs import github, gitlab
 from services.loki import LokiService
 
 settings = get_settings()
@@ -27,7 +27,10 @@ settings = get_settings()
 class CachedStaticFiles(StaticFiles):
     async def get_response(self, path: str, scope) -> Response:
         response = await super().get_response(path, scope)
-        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        if settings.env == "production":
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        else:
+            response.headers["Cache-Control"] = "no-cache"
         return response
 
 
@@ -52,6 +55,31 @@ async def lifespan(app: FastAPI):
             pass
 
 
+class ProxyHeadersMiddleware:
+    """Rewrite scheme and host from X-Forwarded-Proto / X-Forwarded-Host headers.
+
+    Required when running behind a reverse proxy (Traefik) so that
+    request.url_for() generates the correct public URL rather than
+    the internal http://localhost/... URL.
+    """
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            headers = {k.lower(): v for k, v in scope.get("headers", [])}
+            if b"x-forwarded-proto" in headers:
+                scope["scheme"] = headers[b"x-forwarded-proto"].decode()
+            if b"x-forwarded-host" in headers:
+                forwarded_host = headers[b"x-forwarded-host"].decode()
+                host, _, port = forwarded_host.partition(":")
+                scope["server"] = (host, int(port) if port else None)
+                scope["headers"] = [
+                    (k, v) for k, v in scope["headers"] if k.lower() != b"host"
+                ] + [(b"host", forwarded_host.encode())]
+        await self.app(scope, receive, send)
+
+
 app = FastAPI(
     lifespan=lifespan,
     middleware=[
@@ -65,6 +93,7 @@ app = FastAPI(
         Middleware(CSRFProtectMiddleware, csrf_secret=settings.secret_key),
     ],
 )
+app.add_middleware(ProxyHeadersMiddleware)
 app.mount("/assets", CachedStaticFiles(directory="assets"), name="assets")
 os.makedirs(settings.upload_dir, exist_ok=True)
 app.mount("/upload", StaticFiles(directory=settings.upload_dir), name="upload")
@@ -91,6 +120,11 @@ async def refresh_auth_cookie(request: Request, call_next):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/debug-headers")
+async def debug_headers(request: Request):
+    return {"headers": dict(request.headers), "scheme": request.url.scheme, "host": request.url.hostname}
 
 
 @app.get("/deployment-not-found/{host}")
@@ -180,6 +214,7 @@ app.include_router(admin.router)
 app.include_router(user.router)
 app.include_router(project.router)
 app.include_router(github.router)
+app.include_router(gitlab.router)
 app.include_router(google.router)
 app.include_router(team.router)
 app.include_router(event.router)
