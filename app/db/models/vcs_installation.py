@@ -39,6 +39,7 @@ class VcsInstallation(Base):
     provider_account_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     installation_id: Mapped[int | None] = mapped_column(nullable=True, index=True)
     _token: Mapped[str | None] = mapped_column("token", String(2048), nullable=True)
+    _refresh_token: Mapped[str | None] = mapped_column("refresh_token", String(2048), nullable=True)
     token_expires_at: Mapped[datetime | None] = mapped_column(nullable=True)
     status: Mapped[str] = mapped_column(
         SQLAEnum("active", "deleted", "suspended", name="vcs_installation_status"),
@@ -60,6 +61,19 @@ class VcsInstallation(Base):
             self._token = None
         else:
             self._token = _get_fernet().encrypt(value.encode()).decode()
+
+    @property
+    def refresh_token(self) -> str | None:
+        if self._refresh_token is None:
+            return None
+        return _get_fernet().decrypt(self._refresh_token.encode()).decode()
+
+    @refresh_token.setter
+    def refresh_token(self, value: str | None):
+        if not value:
+            self._refresh_token = None
+        else:
+            self._refresh_token = _get_fernet().encrypt(value.encode()).decode()
 
     @override
     def __repr__(self):

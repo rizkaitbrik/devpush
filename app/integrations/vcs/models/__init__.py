@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from enum import Enum
 
 
@@ -23,6 +24,7 @@ class EmailType(Enum):
 class OAuthTokens:
     access_token: str
     refresh_token: str | None = None
+    expires_at: datetime | None = None
 
 
 @dataclass

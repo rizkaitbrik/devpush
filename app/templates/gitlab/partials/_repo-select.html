@@ -1,0 +1,94 @@
+{% if not has_token %}
+<section
+  class="flex items-center justify-center min-h-60 bg-card text-card-foreground border shadow-sm rounded-xl p-4"
+>
+  <div class="max-w-sm">
+    <div class="text-center">
+      <h2 class="h4">{{ _('Connect your GitLab account') }}</h2>
+      <p class="text-muted-foreground mt-1">
+        {{ _('Connect your GitLab account to search for repositories.') }}
+      </p>
+      {% if has_gitlab %}
+        <a class="btn-sm mt-4" href="{{ url_for('gitlab_authorize') }}">
+          {% include "icons/gitlab.svg" %} {{ _('Connect account') }}
+        </a>
+      {% else %}
+        <p class="text-muted-foreground text-sm mt-4">{{ _('GitLab OAuth is not configured.') }}</p>
+      {% endif %}
+    </div>
+  </div>
+</section>
+{% elif accounts %}
+<section class="space-y-4 w-full">
+  <form
+    class="form flex gap-x-2 items-center"
+    hx-trigger="
+      keyup changed delay:500ms from:input[name='query'],
+      search from:input[name='query'],
+      change from:#account-select,
+      load
+    "
+    hx-get="{{ url_for('gitlab_repo_list').include_query_params(type=request.query_params.get('type', '')) }}"
+    hx-target="next [role='listbox']"
+    hx-indicator="next div > .htmx-indicator"
+  >
+    {% from "macros/select.html" import select %} {% call select(
+    id="account-select", selected=selected_account, name="account" ) %} {% for
+    account in accounts %}
+    <div role="option" data-value="{{ account }}">
+      <span class="flex items-center gap-x-2">
+        <img
+          src="{{ vcs_avatar_url('gitlab', account) }}"
+          alt="{{ account }}"
+          class="size-5 rounded"
+          onerror="this.style.display='none'"
+        />
+        {{ account }}
+      </span>
+    </div>
+    {% endfor %}
+    <hr role="separator" />
+    <a role="option" href="{{ url_for('gitlab_authorize') }}">
+      {{ _('Add account') }}
+    </a>
+    {% endcall %}
+
+    <div class="relative flex-1">
+      <input
+        name="query"
+        type="search"
+        class="w-full !pl-9"
+        placeholder="{{ _('Search by name') }}"
+      />
+      <span
+        class="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 opacity-50 [&>svg]:size-4"
+      >
+        {% include "icons/search.svg" %}
+      </span>
+    </div>
+  </form>
+
+  <div class="relative">
+    <div class="h-60 htmx-indicator absolute inset-0 bg-background">
+      {% include "gitlab/partials/_repo-select-list-skeleton.html" %}
+    </div>
+    <div role="listbox" aria-label="Repository list" aria-live="polite"></div>
+  </div>
+</section>
+{% else %}
+<section
+  class="flex items-center justify-center min-h-60 bg-card text-card-foreground border shadow-sm rounded-xl p-4"
+>
+  <div class="max-w-sm">
+    <div class="text-center">
+      <h2 class="h4">{{ _('No GitLab namespaces found') }}</h2>
+      <p class="text-muted-foreground mt-1">
+        {{ _('No accessible namespaces found on your GitLab account.') }}
+      </p>
+      <a class="btn-sm mt-4" href="{{ url_for('gitlab_authorize') }}">
+        {% include "icons/gitlab.svg" %} {{ _('Reconnect account') }}
+      </a>
+    </div>
+  </div>
+</section>
+{% endif %}
