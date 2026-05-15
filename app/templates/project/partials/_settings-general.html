@@ -11,8 +11,9 @@
       "x-init": ""
     }
   ) %}
+    {% set _provider = project.vcs_installation.provider if project.vcs_installation else 'github' %}
     <div
-      hx-get="{{ url_for('github_repo_select').include_query_params(account=repo_owner) }}"
+      hx-get="{{ (url_for('gitlab_repo_select') if _provider == 'gitlab' else url_for('github_repo_select')).include_query_params(account=repo_owner) }}"
       hx-trigger="dialog:opened from:closest dialog once"
       class="flex items-start justify-center h-[296px]"
     >
@@ -125,12 +126,13 @@
             {% include "icons/chevrons-up-down.svg" %}
           </span>
         </button>
+        {% set _provider = project.vcs_installation.provider if project.vcs_installation else 'github' %}
         <a
-          :href="`https://github.com/${repoFullName}`"
+          :href="`{{ 'https://gitlab.com' if _provider == 'gitlab' else 'https://github.com' }}/${repoFullName}`"
           target="_blank"
           class="btn-icon-outline text-muted-foreground hover:text-foreground"
-          data-tooltip="{{ _('View on GitHub') }}"
-          aria-label="{{ _('View on GitHub') }}"
+          data-tooltip="{{ _('View on %(provider)s', provider='GitLab' if _provider == 'gitlab' else 'GitHub') }}"
+          aria-label="{{ _('View on %(provider)s', provider='GitLab' if _provider == 'gitlab' else 'GitHub') }}"
         >
           {% include "icons/arrow-up-right.svg" %}
         </a>

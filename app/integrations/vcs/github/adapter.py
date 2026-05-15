@@ -24,6 +24,34 @@ from integrations.vcs.models import (
     UserInfo,
 )
 
+_DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+
+
+class RateLimitError(Exception):
+    def __init__(self, reset_at: int | None = None, retry_after: int | None = None):
+        self.reset_at = reset_at
+        self.retry_after = retry_after
+        super().__init__("GitHub API rate limit exceeded.")
+
+
+def _check_rate_limit(response: httpx.Response) -> None:
+    if response.status_code == 429:
+        retry_after = None
+        try:
+            retry_after = int(response.headers.get("Retry-After", ""))
+        except (ValueError, TypeError):
+            pass
+        raise RateLimitError(retry_after=retry_after)
+    if response.status_code == 403:
+        remaining = response.headers.get("X-RateLimit-Remaining")
+        if remaining == "0":
+            reset_at = None
+            try:
+                reset_at = int(response.headers.get("X-RateLimit-Reset", ""))
+            except (ValueError, TypeError):
+                pass
+            raise RateLimitError(reset_at=reset_at)
+
 
 class GitHubAdapter:
     def __init__(
@@ -48,7 +76,9 @@ class GitHubAdapter:
             return self._time_offset
 
         try:
-            response = httpx.get("https://api.github.com", timeout=5.0)
+            # Use sync client for this one-off calibration call only
+            with httpx.Client(timeout=5.0) as client:
+                response = client.get("https://api.github.com")
             if "Date" in response.headers:
                 github_time = parsedate_to_datetime(response.headers["Date"])
                 self._time_offset = int(github_time.timestamp()) - now
@@ -77,17 +107,17 @@ class GitHubAdapter:
             )
         return self._jwt_token
 
-
     async def get_oauth_tokens(self, code: str) -> OAuthTokens:
-        response = httpx.post(
-            "https://github.com/login/oauth/access_token",
-            headers={"Accept": "application/json"},
-            data={
-                "client_id": self.client_id,
-                "client_secret": self.client_secret,
-                "code": code,
-            },
-        )
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+            response = await client.post(
+                "https://github.com/login/oauth/access_token",
+                headers={"Accept": "application/json"},
+                data={
+                    "client_id": self.client_id,
+                    "client_secret": self.client_secret,
+                    "code": code,
+                },
+            )
         response.raise_for_status()
         data = response.json()
         return OAuthTokens(
@@ -97,21 +127,27 @@ class GitHubAdapter:
 
     async def get_user_info(self, access_token: str) -> UserInfo:
         headers = {"Authorization": f"Bearer {access_token}"}
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+            user_resp = await client.get("https://api.github.com/user", headers=headers)
+            _check_rate_limit(user_resp)
+            user_resp.raise_for_status()
+            user = user_resp.json()
 
-        user_resp = httpx.get("https://api.github.com/user", headers=headers)
-        user_resp.raise_for_status()
-        user = user_resp.json()
+            emails_resp = await client.get("https://api.github.com/user/emails", headers=headers)
+            _check_rate_limit(emails_resp)
 
-        emails_resp = httpx.get("https://api.github.com/user/emails", headers=headers)
-        emails_resp.raise_for_status()
-
-        emails: dict[str, EmailType] = {
-            entry["email"]: (
-                EmailType.PRIMARY if entry.get("primary") else EmailType.SECONDARY
-            )
-            for entry in emails_resp.json()
-            if entry.get("verified")
-        }
+        if emails_resp.status_code == 200:
+            emails: dict[str, EmailType] = {
+                entry["email"]: (
+                    EmailType.PRIMARY if entry.get("primary") else EmailType.SECONDARY
+                )
+                for entry in emails_resp.json()
+                if entry.get("verified")
+            }
+        else:
+            # Fall back to public email if the emails scope is not granted
+            public_email = user.get("email")
+            emails = {public_email: EmailType.PRIMARY} if public_email else {}
 
         return UserInfo(
             id=str(user["id"]),
@@ -129,25 +165,27 @@ class GitHubAdapter:
         per_page = 100
         total_count = None
 
-        while True:
-            resp = httpx.get(
-                "https://api.github.com/user/installations",
-                headers={"Authorization": f"Bearer {access_token}"},
-                params={"per_page": per_page, "page": page},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            batch = data.get("installations", [])
-            installations.extend(batch)
-            total_count = data.get("total_count", total_count)
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+            while True:
+                resp = await client.get(
+                    "https://api.github.com/user/installations",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    params={"per_page": per_page, "page": page},
+                )
+                _check_rate_limit(resp)
+                resp.raise_for_status()
+                data = resp.json()
+                batch = data.get("installations", [])
+                installations.extend(batch)
+                total_count = data.get("total_count", total_count)
 
-            if (
-                not batch
-                or (total_count is not None and page * per_page >= total_count)
-                or len(batch) < per_page
-            ):
-                break
-            page += 1
+                if (
+                    not batch
+                    or (total_count is not None and page * per_page >= total_count)
+                    or len(batch) < per_page
+                ):
+                    break
+                page += 1
 
         return [
             Account(
@@ -170,7 +208,7 @@ class GitHubAdapter:
         account_name = installation_data["account"]["login"]
 
         if selection == "selected":
-            raw = self._list_installation_repos_for_user(access_token, int(account_id))
+            raw = await self._list_installation_repos_for_user(access_token, int(account_id))
             if query:
                 q = query.lower()
                 raw = [
@@ -194,16 +232,18 @@ class GitHubAdapter:
                     ),
                 )
         else:
-            resp = httpx.get(
-                "https://api.github.com/search/repositories",
-                params={
-                    "q": f"{query} in:name org:{account_name} fork:true".strip(),
-                    "per_page": 5,
-                    "sort": "updated",
-                    "order": "desc",
-                },
-                headers={"Authorization": f"Bearer {access_token}"},
-            )
+            async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+                resp = await client.get(
+                    "https://api.github.com/search/repositories",
+                    params={
+                        "q": f"{query} in:name org:{account_name} fork:true".strip(),
+                        "per_page": 5,
+                        "sort": "updated",
+                        "order": "desc",
+                    },
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+            _check_rate_limit(resp)
             resp.raise_for_status()
             raw = resp.json()["items"]
 
@@ -230,52 +270,58 @@ class GitHubAdapter:
         )
 
     @staticmethod
-    def _list_installation_repos_for_user(
-            access_token: str, installation_id: int
+    async def _list_installation_repos_for_user(
+        access_token: str, installation_id: int
     ) -> list[dict]:
         repos: list[dict] = []
         page = 1
         per_page = 100
         total_count = None
 
-        while True:
-            resp = httpx.get(
-                f"https://api.github.com/user/installations/{installation_id}/repositories",
-                headers={"Authorization": f"Bearer {access_token}"},
-                params={"per_page": per_page, "page": page},
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            batch = data.get("repositories", [])
-            repos.extend(batch)
-            total_count = data.get("total_count", total_count)
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+            while True:
+                resp = await client.get(
+                    f"https://api.github.com/user/installations/{installation_id}/repositories",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                    params={"per_page": per_page, "page": page},
+                )
+                _check_rate_limit(resp)
+                resp.raise_for_status()
+                data = resp.json()
+                batch = data.get("repositories", [])
+                repos.extend(batch)
+                total_count = data.get("total_count", total_count)
 
-            if (
-                not batch
-                or (total_count is not None and page * per_page >= total_count)
-                or len(batch) < per_page
-            ):
-                break
-            page += 1
+                if (
+                    not batch
+                    or (total_count is not None and page * per_page >= total_count)
+                    or len(batch) < per_page
+                ):
+                    break
+                page += 1
 
         return repos
 
     async def get_repository(self, access_token: str, repo_id: int) -> Repository:
-        resp = httpx.get(
-            f"https://api.github.com/repositories/{repo_id}",
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+            resp = await client.get(
+                f"https://api.github.com/repositories/{repo_id}",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+        _check_rate_limit(resp)
         resp.raise_for_status()
         return self._parse_repository(resp.json())
 
     @staticmethod
     async def get_repository_branches(
-            access_token: str, repo_id: int
+        access_token: str, repo_id: int
     ) -> list[Branch]:
-        resp = httpx.get(
-            f"https://api.github.com/repositories/{repo_id}/branches",
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+            resp = await client.get(
+                f"https://api.github.com/repositories/{repo_id}/branches",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+        _check_rate_limit(resp)
         resp.raise_for_status()
         return [Branch(name=b["name"], sha=b["commit"]["sha"]) for b in resp.json()]
 
@@ -294,21 +340,25 @@ class GitHubAdapter:
         if search:
             params["q"] = search
 
-        resp = httpx.get(
-            f"https://api.github.com/repositories/{repo_id}/commits",
-            headers={"Authorization": f"Bearer {access_token}"},
-            params=params,
-        )
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+            resp = await client.get(
+                f"https://api.github.com/repositories/{repo_id}/commits",
+                headers={"Authorization": f"Bearer {access_token}"},
+                params=params,
+            )
+        _check_rate_limit(resp)
         resp.raise_for_status()
         return [self._parse_commit(c) for c in resp.json()]
 
     async def get_repository_commit(
         self, access_token: str, repo_id: int, sha: str
     ) -> Commit:
-        resp = httpx.get(
-            f"https://api.github.com/repositories/{repo_id}/commits/{sha}",
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+            resp = await client.get(
+                f"https://api.github.com/repositories/{repo_id}/commits/{sha}",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+        _check_rate_limit(resp)
         resp.raise_for_status()
         return self._parse_commit(resp.json())
 
@@ -344,11 +394,12 @@ class GitHubAdapter:
         if recursive:
             url += "?recursive=1"
 
-        resp = httpx.get(
-            url,
-            headers={"Authorization": f"Bearer {access_token}"},
-            timeout=10.0,
-        )
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+            resp = await client.get(
+                url,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+        _check_rate_limit(resp)
         resp.raise_for_status()
         data = resp.json()
         items = [
@@ -365,11 +416,12 @@ class GitHubAdapter:
         self, access_token: str, repo_id: int, path: str, ref: str = "HEAD"
     ) -> str | None:
         try:
-            resp = httpx.get(
-                f"https://api.github.com/repositories/{repo_id}/contents/{path}?ref={ref}",
-                headers={"Authorization": f"Bearer {access_token}"},
-                timeout=10.0,
-            )
+            async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+                resp = await client.get(
+                    f"https://api.github.com/repositories/{repo_id}/contents/{path}?ref={ref}",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+            _check_rate_limit(resp)
             resp.raise_for_status()
             return base64.b64decode(resp.json()["content"]).decode("utf-8")
         except httpx.HTTPStatusError as e:
@@ -378,27 +430,33 @@ class GitHubAdapter:
             raise
 
     async def get_installation(self, installation_id: str) -> dict:
-        resp = httpx.get(
-            f"https://api.github.com/app/installations/{installation_id}",
-            headers={"Authorization": f"Bearer {self.jwt_token}"},
-        )
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+            resp = await client.get(
+                f"https://api.github.com/app/installations/{installation_id}",
+                headers={"Authorization": f"Bearer {self.jwt_token}"},
+            )
+        _check_rate_limit(resp)
         resp.raise_for_status()
         return resp.json()
 
     async def get_installation_access_token(
         self, installation_id: str
     ) -> dict[str, Any]:
-        resp = httpx.post(
-            f"https://api.github.com/app/installations/{installation_id}/access_tokens",
-            headers={"Authorization": f"Bearer {self.jwt_token}"},
-        )
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+            resp = await client.post(
+                f"https://api.github.com/app/installations/{installation_id}/access_tokens",
+                headers={"Authorization": f"Bearer {self.jwt_token}"},
+            )
+        _check_rate_limit(resp)
         resp.raise_for_status()
         return resp.json()
 
     async def get_repository_installation(self, repo_full_name: str) -> dict:
-        resp = httpx.get(
-            f"https://api.github.com/repos/{repo_full_name}/installation",
-            headers={"Authorization": f"Bearer {self.jwt_token}"},
-        )
+        async with httpx.AsyncClient(timeout=_DEFAULT_TIMEOUT) as client:
+            resp = await client.get(
+                f"https://api.github.com/repos/{repo_full_name}/installation",
+                headers={"Authorization": f"Bearer {self.jwt_token}"},
+            )
+        _check_rate_limit(resp)
         resp.raise_for_status()
         return resp.json()

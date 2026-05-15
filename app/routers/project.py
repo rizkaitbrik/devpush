@@ -19,6 +19,8 @@ from dependencies import (
     get_deployment_by_id,
     get_team_by_slug,
     get_github_adapter,
+    get_gitlab_adapter,
+    get_gitlab_installation_service,
     get_redis_client,
     get_queue,
     flash,
@@ -65,6 +67,7 @@ from forms.storage import (
 from config import get_settings, Settings
 from db import get_db
 from integrations.vcs.github import GitHubAdapter, GitHubInstallationService
+from integrations.vcs.gitlab import GitLabAdapter, GitLabInstallationService
 from services.deployment import DeploymentService
 from services.domain import DomainService
 from services.preset_detector import PresetDetector
@@ -75,7 +78,7 @@ from utils.team import get_latest_teams
 from utils.pagination import paginate
 from utils.environment import group_branches_by_environment, get_environment_for_branch
 from utils.color import COLORS
-from utils.user import get_user_github_token
+from utils.user import get_user_github_token, get_user_vcs_token
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +199,7 @@ async def new_project_details(
     repo_owner: str = Query(None),
     repo_name: str = Query(None),
     repo_default_branch: str = Query(None),
+    provider: str = Query("github"),
     fragment: str = Query(None),
     current_user: User = Depends(get_current_user),
     team_and_membership: tuple[Team, TeamMember] = Depends(get_team_by_slug),
@@ -204,6 +208,10 @@ async def new_project_details(
     github_adapter: GitHubAdapter = Depends(get_github_adapter),
     github_installation_service: GitHubInstallationService = Depends(
         get_github_installation_service
+    ),
+    gitlab_adapter: GitLabAdapter = Depends(get_gitlab_adapter),
+    gitlab_installation_service: GitLabInstallationService = Depends(
+        get_gitlab_installation_service
     ),
 ):
     team, membership = team_and_membership
@@ -300,87 +308,193 @@ async def new_project_details(
             )
 
     if request.method == "POST" and await form.validate_on_submit():
-        try:
-            github_oauth_token = await get_user_github_token(db, current_user)
-            if not github_oauth_token:
-                raise ValueError("GitHub OAuth token missing.")
-
-            if not form.repo_id.data:
-                raise ValueError("Repository ID missing.")
-
-            repo = await github_adapter.get_repository(
-                github_oauth_token, int(form.repo_id.data)
-            )
-        except Exception:
-            flash(request, "You do not have access to this repository.", "error")
-            return RedirectResponse(
-                request.url_for("new_project", team_slug=team.slug), status_code=303
-            )
-
-        try:
-            installation = await github_adapter.get_repository_installation(
-                repo.full_name
-            )
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 404:
-                flash(
-                    request,
-                    _(
-                        "Install the GitHub app on %(repo)s to continue.",
-                        repo=repo.full_name,
-                    ),
-                    "error",
-                )
+        if provider == "gitlab":
+            # ── GitLab project creation ──────────────────────────────────────
+            try:
+                gitlab_token = await get_user_vcs_token(db, current_user, "gitlab")
+                if not gitlab_token:
+                    raise ValueError("GitLab account not connected.")
+                if not form.repo_id.data:
+                    raise ValueError("Repository ID missing.")
+                repo = await gitlab_adapter.get_repository(gitlab_token, int(form.repo_id.data))
+            except Exception:
+                flash(request, _("You do not have access to this repository."), "error")
                 return RedirectResponse(
                     request.url_for("new_project", team_slug=team.slug), status_code=303
                 )
-            raise
 
-        github_installation = (
-            await github_installation_service.get_or_refresh_installation(
-                installation["id"], db
+            # Find or create the VcsInstallation for this namespace
+            from sqlalchemy import select as sa_select
+            from db.models import VcsInstallation as VcsInstallationModel
+            result = await db.execute(
+                sa_select(VcsInstallationModel).where(
+                    VcsInstallationModel.provider == "gitlab",
+                    VcsInstallationModel.provider_account_name == repo.owner.login,
+                )
             )
-        )
+            gitlab_installation = result.scalar_one_or_none()
 
-        project = Project(
-            name=form.name.data,
-            repo_id=form.repo_id.data,
-            repo_full_name=repo.full_name,
-            vcs_installation=github_installation,
-            config={
+            if not gitlab_installation:
+                try:
+                    accounts = await gitlab_adapter.get_accounts(gitlab_token)
+                    account = next((a for a in accounts if a.name == repo.owner.login), None)
+                    if not account:
+                        raise ValueError(f"Namespace '{repo.owner.login}' not accessible")
+                    gitlab_installation = await gitlab_installation_service.get_or_create(
+                        access_token=gitlab_token,
+                        provider_account_id=account.id,
+                        provider_account_name=account.name,
+                        db=db,
+                    )
+                except Exception:
+                    flash(request, _("Could not find the GitLab namespace for this repository."), "error")
+                    return RedirectResponse(
+                        request.url_for("new_project", team_slug=team.slug), status_code=303
+                    )
+
+            project_config = {
+                "provider": "gitlab",
                 "preset": form.preset.data,
                 "runner": form.runner.data,
                 "root_directory": form.root_directory.data,
                 "build_command": form.build_command.data,
                 "pre_deploy_command": form.pre_deploy_command.data,
                 "start_command": form.start_command.data,
-            },
-            environments=[
-                {
-                    "id": "prod",
-                    "color": "blue",
-                    "name": "Production",
-                    "slug": "production",
-                    "branch": form.production_branch.data,
-                    "status": "active",
-                }
-            ],
-            team=team,
-            created_by_user_id=current_user.id,
-        )
+            }
 
-        db.add(project)
-        await db.flush()
+            project = Project(
+                name=form.name.data,
+                repo_id=form.repo_id.data,
+                repo_full_name=repo.full_name,
+                vcs_installation=gitlab_installation,
+                config=project_config,
+                environments=[
+                    {
+                        "id": "prod",
+                        "color": "blue",
+                        "name": "Production",
+                        "slug": "production",
+                        "branch": form.production_branch.data,
+                        "status": "active",
+                    }
+                ],
+                team=team,
+                created_by_user_id=current_user.id,
+            )
 
-        for entry in form.env_vars:
-            if entry.key.data:
-                env_var = EnvVar(project_id=project.id, key=entry.key.data)
-                env_var.value = entry.value.data or ""
-                env_var.environment = entry.environment.data or None
-                db.add(env_var)
+            db.add(project)
+            await db.flush()
 
-        await db.commit()
-        flash(request, _("Project added."), "success")
+            for entry in form.env_vars:
+                if entry.key.data:
+                    env_var = EnvVar(project_id=project.id, key=entry.key.data)
+                    env_var.value = entry.value.data or ""
+                    env_var.environment = entry.environment.data or None
+                    db.add(env_var)
+
+            # Register GitLab webhook; store hook_id in config for later cleanup
+            if settings.gitlab_webhook_secret:
+                try:
+                    hook_id = await gitlab_adapter.register_webhook(
+                        access_token=gitlab_token,
+                        repo_id=int(form.repo_id.data),
+                        webhook_url=str(request.url_for("gitlab_webhook")),
+                        secret_token=settings.gitlab_webhook_secret,
+                    )
+                    project_config["gitlab_hook_id"] = hook_id
+                    project.config = project_config
+                except Exception:
+                    logger.warning(
+                        "Failed to register GitLab webhook for project %s", project.name,
+                        exc_info=True,
+                    )
+
+            await db.commit()
+            flash(request, _("Project added."), "success")
+
+        else:
+            # ── GitHub project creation ──────────────────────────────────────
+            try:
+                github_oauth_token = await get_user_github_token(db, current_user)
+                if not github_oauth_token:
+                    raise ValueError("GitHub OAuth token missing.")
+
+                if not form.repo_id.data:
+                    raise ValueError("Repository ID missing.")
+
+                repo = await github_adapter.get_repository(
+                    github_oauth_token, int(form.repo_id.data)
+                )
+            except Exception:
+                flash(request, _("You do not have access to this repository."), "error")
+                return RedirectResponse(
+                    request.url_for("new_project", team_slug=team.slug), status_code=303
+                )
+
+            try:
+                installation = await github_adapter.get_repository_installation(
+                    repo.full_name
+                )
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 404:
+                    flash(
+                        request,
+                        _(
+                            "Install the GitHub app on %(repo)s to continue.",
+                            repo=repo.full_name,
+                        ),
+                        "error",
+                    )
+                    return RedirectResponse(
+                        request.url_for("new_project", team_slug=team.slug), status_code=303
+                    )
+                raise
+
+            github_installation = (
+                await github_installation_service.get_or_refresh_installation(
+                    installation["id"], db
+                )
+            )
+
+            project = Project(
+                name=form.name.data,
+                repo_id=form.repo_id.data,
+                repo_full_name=repo.full_name,
+                vcs_installation=github_installation,
+                config={
+                    "preset": form.preset.data,
+                    "runner": form.runner.data,
+                    "root_directory": form.root_directory.data,
+                    "build_command": form.build_command.data,
+                    "pre_deploy_command": form.pre_deploy_command.data,
+                    "start_command": form.start_command.data,
+                },
+                environments=[
+                    {
+                        "id": "prod",
+                        "color": "blue",
+                        "name": "Production",
+                        "slug": "production",
+                        "branch": form.production_branch.data,
+                        "status": "active",
+                    }
+                ],
+                team=team,
+                created_by_user_id=current_user.id,
+            )
+
+            db.add(project)
+            await db.flush()
+
+            for entry in form.env_vars:
+                if entry.key.data:
+                    env_var = EnvVar(project_id=project.id, key=entry.key.data)
+                    env_var.value = entry.value.data or ""
+                    env_var.environment = entry.environment.data or None
+                    db.add(env_var)
+
+            await db.commit()
+            flash(request, _("Project added."), "success")
 
         return RedirectResponseX(
             url=str(
@@ -1071,17 +1185,14 @@ async def project_deploy(
     # Get the list of commits for the selected environment
     branch_names = []
     commits = []
+    branch_token = None
     try:
-        github_installation = (
-            await github_installation_service.get_or_refresh_installation(
-                project.vcs_installation_id, db
-            )
+        branch_token = await github_installation_service.get_token_for_repo(
+            project.repo_full_name
         )
-        if not github_installation.token:
-            raise ValueError("GitHub installation token missing.")
 
         branches = await github_adapter.get_repository_branches(
-            github_installation.token, project.repo_id
+            branch_token, project.repo_id
         )
         branch_names = [branch.name for branch in branches]
     except Exception as e:
@@ -1102,11 +1213,11 @@ async def project_deploy(
         if matching_branches:
             for branch in matching_branches:
                 try:
-                    if not github_installation.token:
+                    if not branch_token:
                         raise ValueError("GitHub installation token missing.")
 
                     branch_commits = await github_adapter.get_repository_commits(
-                        github_installation.token, project.repo_id, branch, per_page=5
+                        branch_token, project.repo_id, branch, per_page=5
                     )
 
                     for commit in branch_commits:
@@ -1479,6 +1590,24 @@ async def project_settings(
         if request.method == "POST" and fragment == "danger":
             if await delete_project_form.validate_on_submit():
                 try:
+                    # Remove GitLab webhook before soft-deleting
+                    hook_id = project.config.get("gitlab_hook_id")
+                    if hook_id and project.vcs_installation_id:
+                        try:
+                            from db.models import VcsInstallation as VcsInstallationModel
+                            vcs_inst = await db.get(VcsInstallationModel, project.vcs_installation_id)
+                            if vcs_inst and vcs_inst.provider == "gitlab" and vcs_inst.token:
+                                gl_adapter = get_gitlab_adapter()
+                                await gl_adapter.delete_webhook(
+                                    vcs_inst.token, project.repo_id, hook_id
+                                )
+                        except Exception:
+                            logger.warning(
+                                "Failed to delete GitLab webhook for project %s",
+                                project.name,
+                                exc_info=True,
+                            )
+
                     project.status = "deleted"
                     await db.commit()
 

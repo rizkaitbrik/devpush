@@ -231,6 +231,7 @@ async def github_authorize_callback(
         flash(request, _("GitHub account connected successfully!"), "success")
 
     except Exception:
+        logger.exception("Error connecting GitHub account")
         flash(request, _("Error connecting GitHub account."), "error")
 
     return RedirectResponse(redirect_url, status_code=303)

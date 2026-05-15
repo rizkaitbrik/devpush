@@ -54,7 +54,7 @@ class GitHubInstallationService:
         return installation
 
     async def refresh(self, vcs_installation_id: str, db: AsyncSession) -> VcsInstallation:
-        """Load a VcsInstallation by its PK and refresh its token if expired."""
+        """Load a VcsInstallation by its PK and always fetch a fresh token."""
         result = await db.execute(
             select(VcsInstallation).where(VcsInstallation.id == vcs_installation_id)
         )
@@ -62,14 +62,20 @@ class GitHubInstallationService:
         if not installation:
             raise ValueError(f"VcsInstallation {vcs_installation_id!r} not found")
 
-        if not installation.token or _is_token_expired(installation):
-            token_data = await self.adapter.get_installation_access_token(
-                str(installation.installation_id)
-            )
-            installation.token = token_data["token"]
-            installation.token_expires_at = datetime.fromisoformat(
-                token_data["expires_at"].replace("Z", "+00:00")
-            ).replace(tzinfo=None)
-            await db.commit()
+        token_data = await self.adapter.get_installation_access_token(
+            str(installation.installation_id)
+        )
+        installation.token = token_data["token"]
+        installation.token_expires_at = datetime.fromisoformat(
+            token_data["expires_at"].replace("Z", "+00:00")
+        ).replace(tzinfo=None)
+        await db.commit()
 
         return installation
+
+    async def get_token_for_repo(self, repo_full_name: str) -> str:
+        """Get a fresh installation token scoped to the installation that covers this repo."""
+        repo_installation = await self.adapter.get_repository_installation(repo_full_name)
+        installation_id = str(repo_installation["id"])
+        token_data = await self.adapter.get_installation_access_token(installation_id)
+        return token_data["token"]

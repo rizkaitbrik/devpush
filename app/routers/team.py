@@ -104,6 +104,7 @@ async def team_index(
 
     projects_result = await db.execute(
         select(Project)
+        .options(selectinload(Project.vcs_installation))
         .where(Project.team_id == team.id, Project.status != "deleted")
         .order_by(Project.updated_at.desc())
         .limit(6)

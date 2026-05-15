@@ -26,6 +26,8 @@ def upgrade() -> None:
     )
     op.alter_column("vcs_installation", "id", nullable=False)
 
+    # Drop the FK that references the old PK before dropping the PK itself
+    op.drop_constraint("project_github_installation_id_fkey", "project", type_="foreignkey")
     op.execute("ALTER TABLE vcs_installation DROP CONSTRAINT github_installation_pkey")
     op.create_primary_key("vcs_installation_pkey", "vcs_installation", ["id"])
 
@@ -67,7 +69,6 @@ def upgrade() -> None:
     )
     op.alter_column("project", "vcs_installation_id", nullable=False)
 
-    op.drop_constraint("project_github_installation_id_fkey", "project", type_="foreignkey")
     op.drop_index("ix_project_github_installation_id", table_name="project")
     op.drop_column("project", "github_installation_id")
 

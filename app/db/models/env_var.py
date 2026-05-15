@@ -6,7 +6,7 @@ from secrets import token_hex
 from typing import TYPE_CHECKING, override
 
 from cryptography.fernet import Fernet
-from sqlalchemy import String, Text, Index, UniqueConstraint
+from sqlalchemy import ForeignKey, String, Text, Index, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from config import get_settings
@@ -39,7 +39,7 @@ class EnvVar(Base):
         String(32), primary_key=True, default=lambda: token_hex(16)
     )
     project_id: Mapped[str] = mapped_column(
-        String(32), index=True, nullable=False
+        String(32), ForeignKey("project.id", ondelete="CASCADE"), index=True, nullable=False
     )
     key: Mapped[str] = mapped_column(String(255), nullable=False)
     _value: Mapped[str] = mapped_column("value", Text, nullable=False, default="")
