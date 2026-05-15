@@ -1,3 +1,7 @@
+{% set repo_id = repo_id | default('') %}
+{% set repo_owner = repo_owner | default('') %}
+{% set repo_name = repo_name | default('') %}
+{% set repo_default_branch = repo_default_branch | default('') %}
 {% macro render_build_and_deploy(form, presets, runners, init_values=true) %}
 <script>
   var presets = {{ presets | tojson }};
@@ -15,6 +19,7 @@
   class="space-y-6"
   x-data="{
     selectedPreset: '{{ form.preset.data or "" }}',
+    selectedRunner: '{{ form.runner.data or "" }}',
     initValues: {{ 'true' if init_values else 'false' }},
     getPreset() {
       if (!this.selectedPreset) return null;
@@ -51,13 +56,14 @@
       };
       this.disableRunnerOptions(preset);
       if (!apply) return;
-      
+
       let runnerValue = preset?.config?.runner;
       const options = Array.from($refs.runnerInput.querySelectorAll('option'));
       if (!options.find(option => option.value === runnerValue && !option.disabled)) {
         runnerValue = options.find(option => !option.disabled && option.parentElement?.label === preset?.category)?.value;
       }
       applyValue($refs.runnerInput, runnerValue);
+      this.selectedRunner = $refs.runnerInput.value;
       applyValue($refs.rootDirectoryInput, preset?.config?.root_directory);
       applyValue($refs.buildCommandInput, preset?.config?.build_command);
       applyValue($refs.preDeployCommandInput, preset?.config?.pre_deploy_command);
@@ -122,15 +128,37 @@
   </div>
 
   {# RUNNER #}
-  <div class="space-y-3">
+  <div class="space-y-3" x-show="selectedRunner !== 'buildpack'" x-cloak>
     {{ form.runner.label() }}
     {{ form.runner(**{
       'x-ref': 'runnerInput',
+      '@change': 'selectedRunner = $event.target.value',
       'aria-invalid': 'true' if form.runner.errors or (is_runner_valid is defined and not is_runner_valid) else 'false'
     }) }}
     {% for error in form.runner.errors %}
       <p class="text-sm text-destructive">{{ error }}</p>
     {% endfor %}
+  </div>
+
+  {# AUTO DETECT #}
+  <div class="flex items-center gap-2">
+    <button
+      type="button"
+      class="btn-sm-outline"
+      @click="
+        setPreset('', true);
+        $refs.runnerInput.value = 'buildpack';
+        selectedRunner = 'buildpack';
+        $refs.buildCommandInput.value = '';
+        $refs.preDeployCommandInput.value = '';
+        $refs.startCommandInput.value = '';
+        $dispatch('input');
+      "
+    >
+      {% include "icons/zap.svg" %}
+      {{ _('Auto detect') }}
+    </button>
+    <span class="text-sm text-muted-foreground">{{ _('Let buildpacks detect and configure your app automatically.') }}</span>
   </div>
 
   {# ROOT DIRECTORY #}
@@ -153,58 +181,65 @@
     </p>
   </div>
 
-  {# BUILD COMMAND #}
-  <div class="space-y-3">
-    {{ form.build_command.label() }}
-    <div class="relative">
-      {{ form.build_command(
-        id=False,
-        class="w-full font-mono text-[13px]",
-        **{'x-ref': 'buildCommandInput'}
-      ) }}
+  <div x-show="selectedRunner !== 'buildpack'" x-cloak>
+    {# BUILD COMMAND #}
+    <div class="space-y-3">
+      {{ form.build_command.label() }}
+      <div class="relative">
+        {{ form.build_command(
+          id=False,
+          class="w-full font-mono text-[13px]",
+          **{'x-ref': 'buildCommandInput'}
+        ) }}
+      </div>
+      {% for error in form.build_command.errors %}
+        <p class="text-sm text-destructive">{{ error }}</p>
+      {% endfor %}
+      <p class="text-sm text-muted-foreground">
+        {{ _('Install dependencies and build the project.') }}
+      </p>
     </div>
-    {% for error in form.build_command.errors %}
-      <p class="text-sm text-destructive">{{ error }}</p>
-    {% endfor %}
-    <p class="text-sm text-muted-foreground">
-      {{ _('Install dependencies and build the project.') }}
-    </p>
+
+    {# PRE-DEPLOY COMMAND #}
+    <div class="space-y-3 mt-6">
+      {{ form.pre_deploy_command.label() }}
+      <div class="relative">
+        {{ form.pre_deploy_command(
+          id=False,
+          class="w-full font-mono text-[13px]",
+          **{'x-ref': 'preDeployCommandInput'}
+        ) }}
+      </div>
+      {% for error in form.pre_deploy_command.errors %}
+        <p class="text-sm text-destructive">{{ error }}</p>
+      {% endfor %}
+      <p class="text-sm text-muted-foreground">
+        {{ _('Run commands before we start the app (e.g. migrate database).') }}
+      </p>
+    </div>
+
+    {# START COMMAND #}
+    <div class="space-y-3 mt-6">
+      {{ form.start_command.label() }}
+      <div class="relative">
+        {{ form.start_command(
+          id=False,
+          class="w-full font-mono text-[13px]",
+          **{'x-ref': 'startCommandInput'}
+        ) }}
+      </div>
+      {% for error in form.start_command.errors %}
+        <p class="text-sm text-destructive">{{ error }}</p>
+      {% endfor %}
+      <p class="text-sm text-muted-foreground">
+        {{ _('Start the app (must listen on <code>0.0.0.0:8000</code>).') | safe }}
+      </p>
+    </div>
   </div>
 
-  {# PRE-DEPLOY COMMAND #}
-  <div class="space-y-3">
-    {{ form.pre_deploy_command.label() }}
-    <div class="relative">
-      {{ form.pre_deploy_command(
-        id=False,
-        class="w-full font-mono text-[13px]",
-        **{'x-ref': 'preDeployCommandInput'}
-      ) }}
-    </div>
-    {% for error in form.pre_deploy_command.errors %}
-      <p class="text-sm text-destructive">{{ error }}</p>
-    {% endfor %}
-    <p class="text-sm text-muted-foreground">
-      {{ _('Run commands before we start the app (e.g. migrate database).') }}
-    </p>
-  </div>
-
-  {# START COMMAND #}
-  <div class="space-y-3">
-    {{ form.start_command.label() }}
-    <div class="relative">
-      {{ form.start_command(
-        id=False,
-        class="w-full font-mono text-[13px]",
-        **{'x-ref': 'startCommandInput'}
-      ) }}
-    </div>
-    {% for error in form.start_command.errors %}
-      <p class="text-sm text-destructive">{{ error }}</p>
-    {% endfor %}
-    <p class="text-sm text-muted-foreground">
-      {{ _('Start the app (must listen on <code>0.0.0.0:8000</code>).') | safe }}
-    </p>
+  <div x-show="selectedRunner === 'buildpack'" x-cloak class="rounded-lg border border-dashed p-4 text-sm text-muted-foreground space-y-1">
+    <p class="font-medium text-foreground">{{ _('Managed by buildpack') }}</p>
+    <p>{{ _('Build and start commands are automatically detected from your repository using Heroku buildpacks.') }}</p>
   </div>
 </div>
 {% endmacro %}

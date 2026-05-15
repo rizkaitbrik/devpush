@@ -304,8 +304,13 @@ async def new_project_details(
                     "presets": enabled_presets,
                     "runners": enabled_runners,
                     "detecting": False,
+                    "repo_id": repo_id,
+                    "repo_owner": repo_owner,
+                    "repo_name": repo_name,
+                    "repo_default_branch": repo_default_branch,
                 },
             )
+
 
     if request.method == "POST" and await form.validate_on_submit():
         if provider == "gitlab":
@@ -1557,6 +1562,8 @@ async def project_settings(
     db: AsyncSession = Depends(get_db),
     settings: Settings = Depends(get_settings),
     queue: ArqRedis = Depends(get_queue),
+    github_adapter: GitHubAdapter = Depends(get_github_adapter),
+    gitlab_adapter: GitLabAdapter = Depends(get_gitlab_adapter),
 ):
     team, membership = team_and_membership
 
@@ -1966,6 +1973,7 @@ async def project_settings(
                     "is_runner_valid": is_runner_valid,
                 },
             )
+
 
     # Resources
     resources_form: Any = await ProjectResourcesForm.from_formdata(
