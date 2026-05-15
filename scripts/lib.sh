@@ -407,12 +407,6 @@ validate_env(){
     APP_HOSTNAME
     DEPLOY_DOMAIN
     EMAIL_SENDER_ADDRESS
-    GITHUB_APP_ID
-    GITHUB_APP_NAME
-    GITHUB_APP_PRIVATE_KEY
-    GITHUB_APP_WEBHOOK_SECRET
-    GITHUB_APP_CLIENT_ID
-    GITHUB_APP_CLIENT_SECRET
     SECRET_KEY
     ENCRYPTION_KEY
     POSTGRES_PASSWORD
@@ -427,19 +421,21 @@ validate_env(){
     [[ -n "$value" ]] || missing+=("$key")
   done
 
-  # Email configuration: RESEND_API_KEY or SMTP settings
-  local resend_key smtp_host smtp_username smtp_password
-  resend_key="$(read_env_value "$env_file" RESEND_API_KEY)"
-  smtp_host="$(read_env_value "$env_file" SMTP_HOST)"
-  smtp_username="$(read_env_value "$env_file" SMTP_USERNAME)"
-  smtp_password="$(read_env_value "$env_file" SMTP_PASSWORD)"
+  # Email configuration: RESEND_API_KEY or SMTP settings (optional in development)
+  if [[ "$ENVIRONMENT" == "production" ]]; then
+    local resend_key smtp_host smtp_username smtp_password
+    resend_key="$(read_env_value "$env_file" RESEND_API_KEY)"
+    smtp_host="$(read_env_value "$env_file" SMTP_HOST)"
+    smtp_username="$(read_env_value "$env_file" SMTP_USERNAME)"
+    smtp_password="$(read_env_value "$env_file" SMTP_PASSWORD)"
 
-  if [[ -n "$resend_key" ]]; then
-    :
-  elif [[ -n "$smtp_host" && -n "$smtp_username" && -n "$smtp_password" ]]; then
-    :
-  else
-    missing+=("RESEND_API_KEY or SMTP_HOST/SMTP_USERNAME/SMTP_PASSWORD")
+    if [[ -n "$resend_key" ]]; then
+      :
+    elif [[ -n "$smtp_host" && -n "$smtp_username" && -n "$smtp_password" ]]; then
+      :
+    else
+      missing+=("RESEND_API_KEY or SMTP_HOST/SMTP_USERNAME/SMTP_PASSWORD")
+    fi
   fi
 
   # Certificate challenge provider-specific environment variables

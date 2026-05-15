@@ -39,3 +39,13 @@ async def get_user_github_token(db: AsyncSession, user: User) -> str | None:
     )
     github_identity = result.scalar_one_or_none()
     return github_identity.access_token if github_identity else None
+
+
+async def get_user_vcs_token(db: AsyncSession, user: User, provider: str) -> str | None:
+    result = await db.execute(
+        select(UserIdentity).where(
+            UserIdentity.user_id == user.id, UserIdentity.provider == provider
+        )
+    )
+    identity = result.scalar_one_or_none()
+    return identity.access_token if identity else None

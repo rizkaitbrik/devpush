@@ -25,13 +25,14 @@
     </span>
   </li>
   <li>
+    {% set _provider = project.vcs_installation.provider if project.vcs_installation else 'github' %}
     <a
       class="text-muted-foreground flex items-center gap-x-2 hover:text-foreground transition-colors [&>svg]:size-4 [&>svg]:opacity-50 dark:[&>svg]:opacity-60 [&>svg]:shrink-0 min-w-0"
-      href="https://github.com/{{ project.repo_full_name }}"
+      href="{{ vcs_repo_url(_provider, project.repo_full_name) }}"
       target="_blank"
       data-tooltip="{{ _('Repository') }}"
     >
-      {% include "icons/github.svg" %}
+      {% if _provider == 'gitlab' %}{% include "icons/gitlab.svg" %}{% else %}{% include "icons/github.svg" %}{% endif %}
       <span class="truncate">{{ project.repo_full_name }}</span>
     </a>
   </li>

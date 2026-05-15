@@ -10,6 +10,7 @@
     url.searchParams.set('repo_owner', $event.detail.owner);
     url.searchParams.set('repo_name', $event.detail.name);
     url.searchParams.set('repo_default_branch', $event.detail.defaultBranch);
+    url.searchParams.set('provider', $event.detail.provider || 'github');
     window.location = url.toString();
   "
 >
@@ -22,29 +23,58 @@
       <div class="shrink-0 rounded-full size-6 bg-primary text-primary-foreground flex items-center justify-center text-xs font-mono font-semibold">1</div>
       <h2 class="font-semibold">{{ _('Select repository') }}</h2>
     </li>
-    <li class="flex-1">
-      <hr class="h-px border-border" />
-    </li>
+    <li class="flex-1"><hr class="h-px border-border" /></li>
     <li class="flex items-center gap-x-2.5 opacity-50">
       <div class="shrink-0 rounded-full size-6 bg-primary text-primary-foreground flex items-center justify-center text-xs font-mono font-semibold">2</div>
       <h2 class="font-semibold">{{ _('Configure') }}</h2>
     </li>
-    <li class="flex-1">
-      <hr class="h-px border-border" />
-    </li>
+    <li class="flex-1"><hr class="h-px border-border" /></li>
     <li class="flex items-center gap-x-2.5 opacity-50">
       <div class="shrink-0 rounded-full size-6 bg-primary text-primary-foreground flex items-center justify-center text-xs font-mono font-semibold">3</div>
       <h2 class="font-semibold">{{ _('Deploy') }}</h2>
     </li>
   </ol>
 
-  <div
-    hx-get="{{ url_for('github_repo_select').include_query_params(type='new_project') }}"
-    hx-trigger="load"
-    hx-swap="outerHTML"    
-    class="flex items-center justify-center h-[292px] w-full"
-  >
-    {% include "github/partials/_repo-select-skeleton.html" %}
+  <div x-data="{ provider: 'github' }">
+    <div class="flex gap-x-2 mb-4">
+      <button
+        type="button"
+        class="btn-sm-outline flex items-center gap-x-1.5"
+        :class="provider === 'github' ? 'bg-accent' : ''"
+        @click="provider = 'github'"
+      >
+        {% include "icons/github.svg" %} GitHub
+      </button>
+      <button
+        type="button"
+        class="btn-sm-outline flex items-center gap-x-1.5"
+        :class="provider === 'gitlab' ? 'bg-accent' : ''"
+        @click="provider = 'gitlab'"
+      >
+        {% include "icons/gitlab.svg" %} GitLab
+      </button>
+    </div>
+
+    <div
+      x-show="provider === 'github'"
+      hx-get="{{ url_for('github_repo_select').include_query_params(type='new_project') }}"
+      hx-trigger="load"
+      hx-swap="innerHTML"
+      class="flex items-center justify-center h-[292px] w-full"
+    >
+      {% include "github/partials/_repo-select-skeleton.html" %}
+    </div>
+
+    <div
+      x-show="provider === 'gitlab'"
+      x-cloak
+      hx-get="{{ url_for('gitlab_repo_select').include_query_params(type='new_project') }}"
+      hx-trigger="load"
+      hx-swap="innerHTML"
+      class="flex items-center justify-center h-[292px] w-full"
+    >
+      {% include "gitlab/partials/_repo-select-skeleton.html" %}
+    </div>
   </div>
 </div>
 {% endblock %}

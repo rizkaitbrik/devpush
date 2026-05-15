@@ -20,14 +20,14 @@ from arq.connections import ArqRedis
 from config import get_settings, Settings
 from db import get_db
 from models import User, Project, Deployment, Team, TeamMember, Storage, utc_now
-from services.github import GitHubService
-from services.github_installation import GitHubInstallationService
+from integrations.vcs.github import GitHubAdapter, GitHubInstallationService
+from integrations.vcs.gitlab import GitLabAdapter, GitLabInstallationService
 
 
 @lru_cache
-def get_github_service() -> GitHubService:
+def get_github_adapter() -> GitHubAdapter:
     settings = get_settings()
-    return GitHubService(
+    return GitHubAdapter(
         client_id=settings.github_app_client_id,
         client_secret=settings.github_app_client_secret,
         app_id=settings.github_app_id,
@@ -37,7 +37,7 @@ def get_github_service() -> GitHubService:
 
 @lru_cache
 def get_github_installation_service() -> GitHubInstallationService:
-    return GitHubInstallationService(get_github_service())
+    return GitHubInstallationService(get_github_adapter())
 
 
 @lru_cache
@@ -56,21 +56,37 @@ def get_github_oauth_client() -> OAuth:
     return oauth
 
 
-async def get_github_primary_email(oauth_client: OAuth, token: dict) -> str | None:
-    """Get user's primary verified email from GitHub."""
-    try:
-        if not oauth_client.github:
-            return None
 
-        response = await oauth_client.github.get("user/emails", token=token)
-        emails = response.json()
+@lru_cache
+def get_gitlab_adapter() -> GitLabAdapter:
+    settings = get_settings()
+    return GitLabAdapter(
+        client_id=settings.gitlab_client_id,
+        client_secret=settings.gitlab_client_secret,
+    )
 
-        primary_email = next(
-            (e for e in emails if e.get("primary") and e.get("verified")), None
-        )
-        return primary_email["email"] if primary_email else None
-    except Exception:
+
+@lru_cache
+def get_gitlab_installation_service() -> GitLabInstallationService:
+    return GitLabInstallationService(get_gitlab_adapter())
+
+
+@lru_cache
+def get_gitlab_oauth_client() -> OAuth:
+    settings = get_settings()
+    if not settings.gitlab_client_id or not settings.gitlab_client_secret:
         return None
+    oauth = OAuth()
+    oauth.register(
+        "gitlab",
+        client_id=settings.gitlab_client_id,
+        client_secret=settings.gitlab_client_secret,
+        access_token_url="https://gitlab.com/oauth/token",
+        authorize_url="https://gitlab.com/oauth/authorize",
+        api_base_url="https://gitlab.com/api/v4/",
+        client_kwargs={"scope": "read_user api"},
+    )
+    return oauth
 
 
 @lru_cache
@@ -374,6 +390,7 @@ async def get_project_by_name(
 
     result = await db.execute(
         select(Project)
+        .options(selectinload(Project.vcs_installation))
         .where(
             func.lower(Project.name) == project_name.lower(),
             Project.team_id == team.id,
@@ -523,6 +540,36 @@ def time_ago_filter(value):
     return humanize.naturaltime(value)
 
 
+def _vcs_repo_url(provider: str, repo_full_name: str) -> str:
+    if provider == "gitlab":
+        return f"https://gitlab.com/{repo_full_name}"
+    return f"https://github.com/{repo_full_name}"
+
+
+def _vcs_commit_url(provider: str, repo_full_name: str, sha: str) -> str:
+    if provider == "gitlab":
+        return f"https://gitlab.com/{repo_full_name}/-/commit/{sha}"
+    return f"https://github.com/{repo_full_name}/commit/{sha}"
+
+
+def _vcs_branch_url(provider: str, repo_full_name: str, branch: str) -> str:
+    if provider == "gitlab":
+        return f"https://gitlab.com/{repo_full_name}/-/tree/{branch}"
+    return f"https://github.com/{repo_full_name}/tree/{branch}"
+
+
+def _vcs_user_url(provider: str, username: str) -> str:
+    if provider == "gitlab":
+        return f"https://gitlab.com/{username}"
+    return f"https://github.com/{username}"
+
+
+def _vcs_avatar_url(provider: str, username: str) -> str:
+    if provider == "gitlab":
+        return f"https://gitlab.com/{username}.png"
+    return f"https://github.com/{username}.png"
+
+
 settings = get_settings()
 templates = Jinja2Templates(
     directory="templates", auto_reload=settings.env == "development"
@@ -537,6 +584,11 @@ templates.env.globals["toaster_header"] = settings.toaster_header
 templates.env.filters["time_ago"] = time_ago_filter
 templates.env.globals["get_access"] = get_access
 templates.env.globals["is_superadmin"] = is_superadmin
+templates.env.globals["vcs_repo_url"] = _vcs_repo_url
+templates.env.globals["vcs_commit_url"] = _vcs_commit_url
+templates.env.globals["vcs_branch_url"] = _vcs_branch_url
+templates.env.globals["vcs_user_url"] = _vcs_user_url
+templates.env.globals["vcs_avatar_url"] = _vcs_avatar_url
 
 
 def TemplateResponse(

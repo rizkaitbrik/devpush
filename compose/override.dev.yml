@@ -6,6 +6,8 @@ services:
     labels:
       - traefik.http.routers.app.entrypoints=web
       - traefik.http.routers.app.priority=10
+      # In dev, accept any host so tunnels (ngrok, etc.) work without reconfiguring
+      - "traefik.http.routers.app.rule=PathPrefix(`/`)"
     volumes:
       - ${APP_DIR:-..}/app:/app
     environment:

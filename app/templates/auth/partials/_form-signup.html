@@ -1,0 +1,57 @@
+<form
+  method="post"
+  action="{{ url_for('auth_signup') }}"
+  class="form grid gap-4"
+  hx-post="{{ url_for('auth_signup') }}"
+  hx-swap="outerHTML"
+  hx-indicator="find .htmx-indicator"
+  x-init="loading = null"
+  @htmx:before-send="loading = 'signup'"
+  @htmx:after-request="loading = null"
+>
+  {{ form.csrf_token }}
+  <div class="grid gap-2">
+    {{ form.email.label(class="label") }}
+    {{ form.email(
+      class="input",
+      placeholder=_("Enter your email"),
+      **{ ':disabled': 'loading' }
+    ) }}
+    {% for error in form.email.errors %}
+    <p class="text-destructive text-xs font-medium">{{ error }}</p>
+    {% endfor %}
+  </div>
+  <div class="grid gap-2">
+    {{ form.password.label(class="label") }}
+    {{ form.password(
+      class="input",
+      placeholder=_("Choose a password"),
+      **{ ':disabled': 'loading' }
+    ) }}
+    {% for error in form.password.errors %}
+    <p class="text-destructive text-xs font-medium">{{ error }}</p>
+    {% endfor %}
+  </div>
+  <div class="grid gap-2">
+    {{ form.password_confirm.label(class="label") }}
+    {{ form.password_confirm(
+      class="input",
+      placeholder=_("Confirm your password"),
+      **{ ':disabled': 'loading' }
+    ) }}
+    {% for error in form.password_confirm.errors %}
+    <p class="text-destructive text-xs font-medium">{{ error }}</p>
+    {% endfor %}
+  </div>
+  <div class="htmx-indicator flex items-center justify-center">
+    <span class="flex items-center gap-x-2 text-muted-foreground [&>svg]:size-4 [&>svg]:animate-spin">
+      {% include "icons/loader.svg" %}
+    </span>
+  </div>
+  <button type="submit" class="btn" :disabled="loading">
+    {{ _("Create account") }}
+    <span x-show="loading === 'signup'" class="[&>svg]:size-4 [&>svg]:animate-spin">
+      {% include "icons/loader.svg" %}
+    </span>
+  </button>
+</form>

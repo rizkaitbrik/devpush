@@ -29,6 +29,22 @@
           {% include "icons/loader.svg" %}
         </span>
       </button>
+      {% if has_gitlab_login %}
+        <button
+          class="btn-outline w-full"
+          @click="
+            loading = 'gitlab';
+            window.location.href = '{{ url_for('auth_gitlab_login') }}';
+          "
+          :disabled="loading"
+        >
+          {% include "icons/gitlab.svg" %}
+          {{ _("Continue with GitLab") }}
+          <span x-show="loading === 'gitlab'" class="[&>svg]:size-4 [&>svg]:animate-spin">
+            {% include "icons/loader.svg" %}
+          </span>
+        </button>
+      {% endif %}
       {% if has_google_login %}
         <button
           class="btn-outline w-full"
@@ -45,6 +61,14 @@
           </span>
         </button>
       {% endif %}
+      <hr>
+      <a href="{{ url_for('auth_password_login') }}" class="btn-outline w-full text-center">
+        {{ _("Sign in with password") }}
+      </a>
+      <p class="text-center text-sm text-muted-foreground">
+        {{ _("Don't have an account?") }}
+        <a href="{{ url_for('auth_signup') }}" class="underline underline-offset-4 hover:text-foreground">{{ _("Sign up") }}</a>
+      </p>
     </section>
   </div>
 </div>

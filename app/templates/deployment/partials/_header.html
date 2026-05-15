@@ -165,11 +165,12 @@
       data-tooltip="{{ _('Trigger') }}"
     >
       {% include "icons/zap.svg" %}
-      <span class="truncate">Commit by <a href="https://github.com/{{ deployment.commit_meta.author }}" class="hover:text-foreground transition-colors" target="_blank">@{{ deployment.commit_meta.author }}</a></span>
+      {% set _provider = deployment.project.vcs_installation.provider if deployment.project and deployment.project.vcs_installation else 'github' %}
+      <span class="truncate">Commit by <a href="{{ vcs_user_url(_provider, deployment.commit_meta.author) }}" class="hover:text-foreground transition-colors" target="_blank">@{{ deployment.commit_meta.author }}</a></span>
     </li>
     <li class="min-w-0">
       <a
-        href="https://github.com/{{ deployment.repo_full_name }}/tree/{{ deployment.branch }}" target="_blank"
+        href="{{ vcs_branch_url(_provider, deployment.repo_full_name, deployment.branch) }}" target="_blank"
         class="flex items-center gap-x-2 text-muted-foreground hover:text-foreground transition-colors [&>svg]:opacity-50 [&>svg]:dark:opacity-60 [&>svg]:size-4 [&>svg]:shrink-0"
         data-tooltip="{{ _('Branch') }}"
       >
@@ -180,7 +181,7 @@
     <li class="min-w-0 max-w-1/2">
       <a
         class="flex items-center gap-x-2 text-muted-foreground hover:text-foreground transition-colors [&>svg]:opacity-50 [&>svg]:dark:opacity-60 [&>svg]:size-4 [&>svg]:shrink-0"
-        href="https://github.com/{{ deployment.repo_full_name }}/commit/{{ deployment.commit_sha }}"
+        href="{{ vcs_commit_url(_provider, deployment.repo_full_name, deployment.commit_sha) }}"
         target="_blank"
         data-tooltip="{{ _('Commit (%(sha)s)', sha=deployment.commit_sha[:7]) }}"
       >
