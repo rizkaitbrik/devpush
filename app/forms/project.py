@@ -425,7 +425,7 @@ class ProjectBuildAndDeployForm(StarletteForm):
     build_command = StringField(_l("Build command"))
     pre_deploy_command = StringField(_l("Pre-deploy command"))
     start_command = StringField(
-        _l("Start command"), validators=[DataRequired(), Length(min=1)]
+        _l("Start command"), validators=[Optional()]
     )
 
     def __init__(self, *args, **kwargs):
@@ -444,6 +444,10 @@ class ProjectBuildAndDeployForm(StarletteForm):
     validate_runner = validate_runner
 
     validate_root_directory = validate_root_directory
+
+    def validate_start_command(self, field):
+        if self.runner.data != "buildpack" and not field.data:
+            raise ValidationError(_("This field is required."))
 
 
 class ProjectGeneralForm(StarletteForm):
@@ -549,7 +553,7 @@ class ProjectCreateForm(StarletteForm):
     build_command = StringField(_l("Build command"))
     pre_deploy_command = StringField(_l("Pre-deploy command"))
     start_command = StringField(
-        _l("Start command"), validators=[DataRequired(), Length(min=1)]
+        _l("Start command"), validators=[Optional()]
     )
     env_vars = FieldList(FormField(ProjectEnvVarForm))
     submit = SubmitField(_l("Save"))
@@ -593,6 +597,10 @@ class ProjectCreateForm(StarletteForm):
                 )
 
     validate_runner = validate_runner
+
+    def validate_start_command(self, field):
+        if self.runner.data != "buildpack" and not field.data:
+            raise ValidationError(_("This field is required."))
 
 
 class ProjectDeleteForm(StarletteForm):
