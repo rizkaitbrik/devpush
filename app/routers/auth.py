@@ -1,7 +1,7 @@
 from typing import Annotated
 import logging
 from fastapi import APIRouter, Request, Depends, HTTPException
-from starlette.responses import RedirectResponse
+from starlette.responses import RedirectResponse, Response
 from authlib.jose import jwt
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -12,6 +12,8 @@ from typing import Any
 import secrets
 
 from config import Settings, get_settings
+import time
+
 from dependencies import (
     get_translation as _,
     flash,
@@ -21,19 +23,24 @@ from dependencies import (
     RedirectResponseX,
     get_github_oauth_client,
     get_github_adapter,
+    get_gitlab_oauth_client,
+    get_gitlab_adapter,
+    get_gitlab_installation_service,
     get_google_oauth_client,
     get_google_user_info,
     decode_jwt_claims,
     get_redis_client,
     get_queue,
 )
+from datetime import timezone
 from integrations.vcs.models import EmailType
 from db import get_db
 from models import User, UserIdentity, TeamInvite, TeamMember, Team, utc_now
-from forms.auth import EmailLoginForm
+from forms.auth import EmailLoginForm, SignupForm, PasswordLoginForm
 from utils.email import send_email
 from utils.user import sanitize_username, get_user_by_email, get_user_by_provider
 from utils.access import is_email_allowed, notify_denied
+from utils.password import hash_password, verify_password
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +115,7 @@ async def _create_user_with_team(
     return user
 
 
-def _create_session_cookie(user: User, settings: Settings) -> RedirectResponse:
+def _create_session_cookie(user: User, settings: Settings, request: Request | None = None) -> Response:
     now = utc_now()
     expires_at = now + timedelta(days=settings.auth_token_ttl_days)
     jwt_token = jwt.encode(
@@ -126,16 +133,19 @@ def _create_session_cookie(user: User, settings: Settings) -> RedirectResponse:
     jwt_token_str = (
         jwt_token.decode("utf-8") if isinstance(jwt_token, bytes) else jwt_token
     )
-    response = RedirectResponse("/", status_code=302)
-    response.set_cookie(
-        "auth_token",
-        jwt_token_str,
+    cookie_kwargs = dict(
         httponly=True,
         samesite="lax",
         secure=(settings.url_scheme == "https"),
         path="/",
         max_age=settings.auth_token_ttl_days * 24 * 60 * 60,
     )
+    # HTMX intercepts 302 and swaps the empty body; use HX-Redirect for full navigation
+    if request and request.headers.get("HX-Request"):
+        response = Response(status_code=200, headers={"HX-Redirect": "/"})
+    else:
+        response = RedirectResponse("/", status_code=302)
+    response.set_cookie("auth_token", jwt_token_str, **cookie_kwargs)
     return response
 
 
@@ -264,6 +274,9 @@ async def auth_login(
             "form": form,
             "has_google_login": bool(
                 settings.google_client_id and settings.google_client_secret
+            ),
+            "has_gitlab_login": bool(
+                settings.gitlab_client_id and settings.gitlab_client_secret
             ),
             "login_header": settings.login_header,
         },
@@ -638,6 +651,212 @@ async def auth_google_callback(
         return _create_session_cookie(user, settings)
     except Exception:
         flash(request, _("Google login failed"), "error")
+        return RedirectResponse("/auth/login", status_code=303)
+
+
+@router.api_route("/signup", methods=["GET", "POST"], name="auth_signup")
+async def auth_signup(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+    db: AsyncSession = Depends(get_db),
+):
+    form = await SignupForm.from_formdata(request)
+
+    if request.method == "POST" and await form.validate():
+        email = form.email.data
+        password = form.password.data
+
+        if not await is_email_allowed(email, db):
+            await notify_denied(request, db, email)
+            flash(request, _(settings.access_denied_message), "error")
+            return TemplateResponse(
+                request, "auth/partials/_form-signup.html", {"form": form}
+            )
+
+        existing = await get_user_by_email(db, email)
+        if existing:
+            form.email.errors.append(_("An account with this email already exists."))
+            return TemplateResponse(
+                request, "auth/partials/_form-signup.html", {"form": form}
+            )
+
+        user = await _create_user_with_team(request, db, email)
+        identity = UserIdentity(
+            user_id=user.id,
+            provider="password",
+            password_hash=hash_password(password),
+        )
+        db.add(identity)
+        await db.commit()
+        await db.refresh(user)
+        return _create_session_cookie(user, settings, request)
+
+    return TemplateResponse(
+        request,
+        "auth/pages/signup.html",
+        {"form": form},
+    )
+
+
+@router.api_route("/login/password", methods=["GET", "POST"], name="auth_password_login")
+async def auth_password_login(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+    db: AsyncSession = Depends(get_db),
+):
+    form = await PasswordLoginForm.from_formdata(request)
+
+    if request.method == "POST" and await form.validate():
+        email = form.email.data
+        password = form.password.data
+
+        user = await get_user_by_email(db, email)
+        if user:
+            result = await db.execute(
+                select(UserIdentity).where(
+                    UserIdentity.user_id == user.id,
+                    UserIdentity.provider == "password",
+                )
+            )
+            identity = result.scalar_one_or_none()
+            if identity and identity.password_hash and verify_password(password, identity.password_hash):
+                await db.commit()
+                return _create_session_cookie(user, settings, request)
+
+        flash(request, _("Invalid email or password."), "error")
+        return TemplateResponse(
+            request, "auth/partials/_form-password-login.html", {"form": form}
+        )
+
+    return TemplateResponse(
+        request,
+        "auth/pages/password-login.html",
+        {"form": form},
+    )
+
+
+@router.get("/gitlab", name="auth_gitlab_login")
+async def auth_gitlab_login(
+    request: Request,
+    oauth_client=Depends(get_gitlab_oauth_client),
+):
+    if not oauth_client:
+        raise HTTPException(status_code=500, detail="GitLab OAuth client not configured")
+    return await oauth_client.gitlab.authorize_redirect(
+        request, request.url_for("auth_gitlab_callback")
+    )
+
+
+@router.get("/gitlab/callback", name="auth_gitlab_callback")
+async def auth_gitlab_callback(
+    request: Request,
+    settings: Annotated[Settings, Depends(get_settings)],
+    db: AsyncSession = Depends(get_db),
+    oauth_client=Depends(get_gitlab_oauth_client),
+):
+    if not oauth_client:
+        raise HTTPException(status_code=500, detail="GitLab OAuth client not configured")
+
+    try:
+        token = await oauth_client.gitlab.authorize_access_token(request)
+        access_token = token["access_token"]
+        refresh_token = token.get("refresh_token")
+
+        expires_at = None
+        expires_in = token.get("expires_in")
+        if expires_in:
+            created_at = token.get("created_at", int(time.time()))
+            expires_at = datetime.fromtimestamp(
+                created_at + expires_in, tz=timezone.utc
+            ).replace(tzinfo=None)
+
+        gitlab_adapter = get_gitlab_adapter()
+        gl_user = await gitlab_adapter.get_user_info(access_token)
+
+        user = await get_user_by_provider(db, "gitlab", gl_user.id)
+
+        if user:
+            result = await db.execute(
+                select(UserIdentity).where(
+                    UserIdentity.user_id == user.id,
+                    UserIdentity.provider == "gitlab",
+                )
+            )
+            gitlab_identity = result.scalar_one_or_none()
+            if gitlab_identity:
+                gitlab_identity.access_token = access_token
+                if refresh_token:
+                    gitlab_identity.refresh_token = refresh_token
+                if expires_at:
+                    gitlab_identity.token_expires_at = expires_at
+                gitlab_identity.provider_metadata = {
+                    "username": gl_user.username,
+                    "name": gl_user.name,
+                }
+        else:
+            email = next(
+                (e for e, t in gl_user.emails.items() if t == EmailType.PRIMARY), None
+            )
+            if email:
+                user = await get_user_by_email(db, email)
+
+            if not user:
+                if email and not await is_email_allowed(email, db):
+                    await notify_denied(
+                        email,
+                        "gitlab",
+                        request,
+                        settings.access_denied_webhook,
+                    )
+                    flash(request, _(settings.access_denied_message), "error")
+                    return RedirectResponse("/auth/login", status_code=303)
+                user = await _create_user_with_team(
+                    request,
+                    db,
+                    email=email or f"{gl_user.username}@gitlab.local",
+                    name=gl_user.name,
+                    username=gl_user.username,
+                )
+
+            gitlab_identity = UserIdentity(
+                user_id=user.id,
+                provider="gitlab",
+                provider_user_id=gl_user.id,
+                access_token=access_token,
+                refresh_token=refresh_token,
+                token_expires_at=expires_at,
+                provider_metadata={
+                    "username": gl_user.username,
+                    "name": gl_user.name,
+                },
+            )
+            db.add(gitlab_identity)
+
+        await db.commit()
+        await db.refresh(user)
+
+        # Create/refresh the personal namespace VcsInstallation on login
+        try:
+            gitlab_installation_service = get_gitlab_installation_service()
+            accounts = await gitlab_adapter.get_accounts(access_token)
+            personal = next((a for a in accounts if a.name == gl_user.username), None)
+            if personal:
+                await gitlab_installation_service.get_or_create(
+                    access_token=access_token,
+                    provider_account_id=personal.id,
+                    provider_account_name=personal.name,
+                    db=db,
+                    refresh_token=refresh_token,
+                    token_expires_at=expires_at,
+                )
+        except Exception:
+            logger.warning("Could not create VcsInstallation on GitLab login", exc_info=True)
+
+        return _create_session_cookie(user, settings)
+
+    except Exception:
+        logger.exception("GitLab login failed")
+        flash(request, _("GitLab login failed"), "error")
         return RedirectResponse("/auth/login", status_code=303)
 
 

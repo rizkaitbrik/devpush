@@ -55,7 +55,7 @@ class UserIdentity(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("user.id"), index=True)
     provider: Mapped[str] = mapped_column(
-        SQLAEnum("github", "google", name="identity_provider"),
+        SQLAEnum("github", "google", "password", "gitlab", name="identity_provider"),
         nullable=False,
         index=True,
     )
